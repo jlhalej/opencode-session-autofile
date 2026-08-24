@@ -1,0 +1,42 @@
+{
+  "name": "opencode-session-autofile",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that files sessions into OpenChamber folders from title prefixes.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun --format esm",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "openchamber",
+    "session",
+    "autofile"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jlhalej/opencode-session-autofile.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jlhalej/opencode-session-autofile/issues"
+  },
+  "homepage": "https://github.com/jlhalej/opencode-session-autofile#readme",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.0",
+    "bun-types": "^1.3.14",
+    "typescript": "^5.9.0"
+  }
+}
