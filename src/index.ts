@@ -25,7 +25,7 @@ export type SessionAutofileOptions = {
 }
 
 const MAX_WRITE_ATTEMPTS = 3
-const PREFIX = /^\[([A-Za-z][A-Za-z -]{0,40})\]\s+/
+const SUFFIX = /\s+\[([A-Za-z][A-Za-z -]{0,40})\]\s*$/
 
 const DEFAULT_MAPPINGS: Record<string, Mapping> = {
   Language: { folderName: "Language" },
@@ -41,7 +41,7 @@ const DEFAULT_MAPPINGS: Record<string, Mapping> = {
 
 const DEFAULT_TITLE_PROMPT = `You generate short, descriptive titles for conversations. Respond with ONLY the title text — no explanation, quotes, or ending punctuation.
 
-Start every title with exactly one classification prefix from this list, followed by a space and a concise description in the user's language:
+Write a concise description in the user's language, then end every title with exactly one classification tag from this list:
 
 - [Language] — language learning, translation, or French study.
 - [Tech] — software, IT, OpenCode/OpenChamber, infrastructure, or technical projects.
@@ -71,7 +71,7 @@ function resolveOptions(options: Record<string, unknown>): Required<Pick<Session
 }
 
 function parseLabel(title: string): string | undefined {
-  return PREFIX.exec(title)?.[1]
+  return SUFFIX.exec(title)?.[1]
 }
 
 function apiUrl(apiBaseUrl: string, path: string) {

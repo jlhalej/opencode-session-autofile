@@ -1,6 +1,6 @@
 # opencode-session-autofile
 
-An OpenCode plugin that files sessions into OpenChamber folders from controlled title prefixes. It injects a title prompt, listens to `session.updated`, and moves the exact session ID into the mapped folder. Missing mapped folders are created automatically.
+An OpenCode plugin that files sessions into OpenChamber folders from controlled title tags. It injects a title prompt, listens to `session.updated`, and moves the exact session ID into the mapped folder. Titles use a suffix such as `French verb practice [Language]`. Missing mapped folders are created automatically.
 
 ## Install from the OpenChamber plugin screen
 
@@ -38,8 +38,8 @@ Once this package is published to npm, choose **From npm**, use `opencode-sessio
 | --- | --- | --- |
 | `enabled` | `true` | Kill switch for filing; title prompt still loads. |
 | `apiBaseUrl` | `http://localhost:3000` | OpenChamber API base URL. |
-| `mappings` | Built-in domain list | Exact title label to destination folder mapping. |
-| `titlePrompt` | Built-in prefix prompt | Full replacement prompt for OpenCode's native `title` agent. |
+| `mappings` | Built-in domain list | Exact title-tag to destination-folder mapping. |
+| `titlePrompt` | Built-in suffix prompt | Full replacement prompt for OpenCode's native `title` agent. |
 
 Unknown labels and `[Unfiled]` do nothing. A mapped destination folder is created if it does not exist. Duplicate matching folder names are skipped safely. A filing failure never blocks the chat.
 
