@@ -22,10 +22,14 @@ export type SessionAutofileOptions = {
   apiBaseUrl?: string
   mappings?: Record<string, Mapping>
   titlePrompt?: string
+  fallbackMaxAttempts?: number
+  fallbackDelayMs?: number
 }
 
 const MAX_WRITE_ATTEMPTS = 3
 const SUFFIX = /\s+\[([A-Za-z][A-Za-z -]{0,40})\]\s*$/
+const DEFAULT_FALLBACK_MAX_ATTEMPTS = 3
+const DEFAULT_FALLBACK_DELAY_MS = 500
 
 const DEFAULT_MAPPINGS: Record<string, Mapping> = {
   Language: { folderName: "Language" },
@@ -60,18 +64,39 @@ function log(message: string, detail?: unknown) {
   console.error("[session-autofile]", message, detail ?? "")
 }
 
-function resolveOptions(options: Record<string, unknown>): Required<Pick<SessionAutofileOptions, "enabled" | "apiBaseUrl" | "titlePrompt">> & { mappings: Record<string, Mapping> } {
+function resolveOptions(options: Record<string, unknown>): Required<Pick<SessionAutofileOptions, "enabled" | "apiBaseUrl" | "titlePrompt" | "fallbackMaxAttempts" | "fallbackDelayMs">> & { mappings: Record<string, Mapping> } {
   const mappings = options.mappings
+  const fallbackMaxAttempts = options.fallbackMaxAttempts
+  const fallbackDelayMs = options.fallbackDelayMs
   return {
     enabled: options.enabled !== false,
     apiBaseUrl: typeof options.apiBaseUrl === "string" && options.apiBaseUrl.trim() ? options.apiBaseUrl : "http://localhost:3000",
     titlePrompt: typeof options.titlePrompt === "string" && options.titlePrompt.trim() ? options.titlePrompt.trim() : DEFAULT_TITLE_PROMPT,
     mappings: mappings && typeof mappings === "object" && !Array.isArray(mappings) ? mappings as Record<string, Mapping> : DEFAULT_MAPPINGS,
+    fallbackMaxAttempts: typeof fallbackMaxAttempts === "number" && Number.isInteger(fallbackMaxAttempts) && fallbackMaxAttempts >= 1 && fallbackMaxAttempts <= 10 ? fallbackMaxAttempts : DEFAULT_FALLBACK_MAX_ATTEMPTS,
+    fallbackDelayMs: typeof fallbackDelayMs === "number" && Number.isFinite(fallbackDelayMs) && fallbackDelayMs >= 0 && fallbackDelayMs <= 5_000 ? fallbackDelayMs : DEFAULT_FALLBACK_DELAY_MS,
   }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function parseLabel(title: string): string | undefined {
   return SUFFIX.exec(title)?.[1]
+}
+
+type Classification =
+  | { status: "no-tag" }
+  | { status: "unmapped"; label: string }
+  | { status: "mapped"; label: string; mapping: Mapping }
+
+function classifyTitle(title: string, mappings: Record<string, Mapping>): Classification {
+  const label = parseLabel(title)
+  if (!label) return { status: "no-tag" }
+  const mapping = mappings[label]
+  if (!mapping?.folderName?.trim()) return { status: "unmapped", label }
+  return { status: "mapped", label, mapping }
 }
 
 function apiUrl(apiBaseUrl: string, path: string) {
@@ -135,8 +160,47 @@ async function moveSession(apiBaseUrl: string, scope: string, sessionID: string,
   throw new Error("OpenChamber folder state changed too often to file the session")
 }
 
-export default (async (_input, options = {}) => {
+export default (async (input, options = {}) => {
   const config = resolveOptions(options)
+  // Sessions confirmed filed (or confirmed terminally unfiled, e.g. `[Unfiled]`/unmapped
+  // tag) so the fallback stops rechecking them. Session IDs are globally unique, so a
+  // flat set is sufficient without directory scoping.
+  const resolvedSessions = new Set<string>()
+  // Guards against two overlapping fallback retry loops for the same session if
+  // `session.idle` fires again while a loop is already in flight.
+  const pendingFallback = new Set<string>()
+
+  async function runFallback(sessionID: string) {
+    if (!config.enabled || resolvedSessions.has(sessionID) || pendingFallback.has(sessionID)) return
+    pendingFallback.add(sessionID)
+    try {
+      for (let attempt = 0; attempt < config.fallbackMaxAttempts; attempt += 1) {
+        if (attempt > 0) await delay(config.fallbackDelayMs)
+        if (resolvedSessions.has(sessionID)) return
+
+        const { data } = await input.client.session.get({ path: { id: sessionID }, signal: AbortSignal.timeout(5_000) })
+        if (!data?.id || !data.directory) continue
+
+        const classification = classifyTitle(data.title, config.mappings)
+        if (classification.status === "no-tag") continue
+        if (classification.status === "unmapped") {
+          resolvedSessions.add(sessionID)
+          log("fallback: tag unmapped, no folder", { sessionID, label: classification.label })
+          return
+        }
+
+        const result = await moveSession(config.apiBaseUrl, data.directory, data.id, classification.mapping.folderName)
+        resolvedSessions.add(sessionID)
+        log(`fallback ${result}`, { sessionID, label: classification.label, folderName: classification.mapping.folderName })
+        return
+      }
+    } catch (error) {
+      log("fallback check failed; chat continues", error instanceof Error ? error.message : error)
+    } finally {
+      pendingFallback.delete(sessionID)
+    }
+  }
+
   return {
     config: async (opencodeConfig) => {
       const mutableConfig = opencodeConfig as typeof opencodeConfig & { agent?: Record<string, Record<string, unknown>> }
@@ -144,16 +208,29 @@ export default (async (_input, options = {}) => {
       mutableConfig.agent.title = { ...mutableConfig.agent.title, prompt: config.titlePrompt }
     },
     event: async ({ event }) => {
-      if (event.type !== "session.updated" || !config.enabled) return
-      try {
-        const info = event.properties.info
-        const label = parseLabel(info.title)
-        const mapping = label ? config.mappings[label] : undefined
-        if (!info.id || !info.directory || !mapping?.folderName?.trim()) return
-        const result = await moveSession(config.apiBaseUrl, info.directory, info.id, mapping.folderName)
-        log(result, { sessionID: info.id, label, folderName: mapping.folderName })
-      } catch (error) {
-        log("filing failed; chat continues", error instanceof Error ? error.message : error)
+      if (!config.enabled) return
+
+      if (event.type === "session.updated") {
+        try {
+          const info = event.properties.info
+          const classification = classifyTitle(info.title, config.mappings)
+          if (classification.status !== "mapped" || !info.id || !info.directory) return
+          const result = await moveSession(config.apiBaseUrl, info.directory, info.id, classification.mapping.folderName)
+          resolvedSessions.add(info.id)
+          log(result, { sessionID: info.id, label: classification.label, folderName: classification.mapping.folderName })
+        } catch (error) {
+          log("filing failed; chat continues", error instanceof Error ? error.message : error)
+        }
+        return
+      }
+
+      // Fallback/catch-up path: `session.updated` delivery for the session's first
+      // real, tagged title can be missed (event timing/ordering at session start).
+      // `session.idle` fires reliably once the turn is over and gives us a sessionID
+      // we can use to pull the session's current title directly, independent of
+      // whether the triggering `session.updated` was ever observed by this plugin.
+      if (event.type === "session.idle") {
+        await runFallback(event.properties.sessionID)
       }
     },
   }
