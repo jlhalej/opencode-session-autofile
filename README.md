@@ -45,7 +45,7 @@ Once this package is published to npm, choose **From npm**, use `opencode-sessio
 | `fallbackMaxAttempts` | `3` | Max bounded re-checks of a session's title on `session.idle` if the primary `session.updated` filing was missed. |
 | `fallbackDelayMs` | `500` | Delay between fallback re-checks, in milliseconds. |
 
-Unknown labels and `[Unfiled]` do nothing. A mapped destination folder is created if it does not exist. Duplicate matching folder names are skipped safely. A filing failure never blocks the chat.
+The plugin recognizes mapped square-bracket tags anywhere in a title, including before a scheduler-added timestamp such as `Morning sales brief [Sales] 2026-08-28 06:00`. Unknown labels and `[Unfiled]` do nothing. A mapped destination folder is created if it does not exist. Duplicate matching folder names are skipped safely. A filing failure never blocks the chat.
 
 ## Development
 

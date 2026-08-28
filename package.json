@@ -1,7 +1,7 @@
 {
   "name": "opencode-session-autofile",
-  "version": "0.2.0",
-  "description": "OpenCode plugin that files sessions into OpenChamber folders from title prefixes.",
+  "version": "0.3.0",
+  "description": "OpenCode plugin that files sessions into OpenChamber folders from title tags.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": "./dist/index.js",

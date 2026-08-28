@@ -27,7 +27,7 @@ export type SessionAutofileOptions = {
 }
 
 const MAX_WRITE_ATTEMPTS = 3
-const SUFFIX = /\s+\[([A-Za-z][A-Za-z -]{0,40})\]\s*$/
+const TAG = /\[([^\]\r\n]{1,40})\]/g
 const DEFAULT_FALLBACK_MAX_ATTEMPTS = 3
 const DEFAULT_FALLBACK_DELAY_MS = 500
 
@@ -82,8 +82,8 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function parseLabel(title: string): string | undefined {
-  return SUFFIX.exec(title)?.[1]
+function parseLabels(title: string): string[] {
+  return Array.from(title.matchAll(TAG), (match) => match[1].trim()).filter(Boolean)
 }
 
 type Classification =
@@ -92,11 +92,15 @@ type Classification =
   | { status: "mapped"; label: string; mapping: Mapping }
 
 function classifyTitle(title: string, mappings: Record<string, Mapping>): Classification {
-  const label = parseLabel(title)
-  if (!label) return { status: "no-tag" }
-  const mapping = mappings[label]
-  if (!mapping?.folderName?.trim()) return { status: "unmapped", label }
-  return { status: "mapped", label, mapping }
+  const labels = parseLabels(title)
+  if (labels.length > 0) {
+    for (const label of labels) {
+      const mapping = mappings[label]
+      if (mapping?.folderName?.trim()) return { status: "mapped", label, mapping }
+    }
+    return { status: "unmapped", label: labels[0] }
+  }
+  return { status: "no-tag" }
 }
 
 function apiUrl(apiBaseUrl: string, path: string) {

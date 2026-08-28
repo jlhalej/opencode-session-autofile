@@ -100,6 +100,24 @@ describe("opencode-session-autofile", () => {
     expect(folders[0].sessionIds).toEqual(["ses_1"])
   })
 
+  test("primary path: a valid tag before a scheduler timestamp files the session", async () => {
+    const hooks = await plugin(makeInput(async () => ({ data: undefined })), {
+      apiBaseUrl: "http://localhost:9999",
+    })
+
+    await hooks.event!({
+      event: {
+        type: "session.updated",
+        properties: { info: session({ id: "ses_scheduled", directory: "/proj", title: "Morning sales brief [Sales] 2026-08-28 06:00" }) },
+      } as any,
+    })
+
+    const folders = folderApi.getState().foldersMap["/proj"]
+    expect(folders).toHaveLength(1)
+    expect(folders[0].name).toBe("Sales")
+    expect(folders[0].sessionIds).toEqual(["ses_scheduled"])
+  })
+
   test("fallback: first session.idle check misses the tag, a later bounded check within budget files it", async () => {
     const sessionGet = makeSessionGetQueue([
       { data: session({ id: "ses_2", directory: "/session/scope", title: "Untitled" }) },
