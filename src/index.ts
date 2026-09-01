@@ -27,6 +27,7 @@ export type SessionAutofileOptions = {
 }
 
 const MAX_WRITE_ATTEMPTS = 3
+const WRITE_RETRY_DELAY_MS = 50
 const TAG = /\[([^\]\r\n]{1,40})\]/g
 const DEFAULT_FALLBACK_MAX_ATTEMPTS = 3
 const DEFAULT_FALLBACK_DELAY_MS = 500
@@ -115,8 +116,14 @@ async function getFolderState(apiBaseUrl: string): Promise<FolderState> {
   return state as FolderState
 }
 
-async function writeFolderState(apiBaseUrl: string, state: FolderState, baseRev: number): Promise<Response> {
-  return fetch(apiUrl(apiBaseUrl, "/api/session-folders"), {
+// The server accepts the write with HTTP 200 but silently drops it (`{ success: true,
+// ignored: true }`) when its stored state is already at least as fresh as our
+// `updatedAt`. That is a real conflict, not a success: our merge was computed against
+// state that a concurrent writer has since superseded. Treat it exactly like a 409 so
+// the caller re-fetches the latest state and retries instead of reporting the move as
+// done.
+async function writeFolderState(apiBaseUrl: string, state: FolderState, baseRev: number): Promise<"success" | "retry"> {
+  const response = await fetch(apiUrl(apiBaseUrl, "/api/session-folders"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -128,10 +135,16 @@ async function writeFolderState(apiBaseUrl: string, state: FolderState, baseRev:
     }),
     signal: AbortSignal.timeout(5_000),
   })
+  if (response.status === 409) return "retry"
+  if (!response.ok) throw new Error(`POST /api/session-folders returned HTTP ${response.status}`)
+  const body = await response.json().catch(() => null) as { ignored?: unknown } | null
+  if (body && body.ignored === true) return "retry"
+  return "success"
 }
 
 async function moveSession(apiBaseUrl: string, scope: string, sessionID: string, folderName: string): Promise<"moved" | "created-and-moved" | "already-filed" | "folder-ambiguous"> {
   for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) await delay(WRITE_RETRY_DELAY_MS)
     const state = await getFolderState(apiBaseUrl)
     const foldersMap = state.foldersMap ?? (state.foldersMap = {})
     const folders = foldersMap[scope] ?? (foldersMap[scope] = [])
@@ -157,11 +170,10 @@ async function moveSession(apiBaseUrl: string, scope: string, sessionID: string,
         : current.filter((id) => id !== sessionID)
     }
 
-    const response = await writeFolderState(apiBaseUrl, state, typeof state.rev === "number" ? state.rev : 0)
-    if (response.ok) return created ? "created-and-moved" : "moved"
-    if (response.status !== 409) throw new Error(`POST /api/session-folders returned HTTP ${response.status}`)
+    const outcome = await writeFolderState(apiBaseUrl, state, typeof state.rev === "number" ? state.rev : 0)
+    if (outcome === "success") return created ? "created-and-moved" : "moved"
   }
-  throw new Error("OpenChamber folder state changed too often to file the session")
+  throw new Error("OpenChamber rejected or ignored the write too many times to file the session")
 }
 
 export default (async (input, options = {}) => {

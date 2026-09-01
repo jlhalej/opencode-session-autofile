@@ -9,10 +9,23 @@ type FolderApiMock = {
   getState: () => any
 }
 
-function createFolderApiMock(): FolderApiMock {
-  let state: any = { version: 1, rev: 0, foldersMap: {}, collapsedFolderIds: [] }
+type FolderApiMockOptions = {
+  // Number of upcoming POSTs to unconditionally answer with the real server's
+  // `HTTP 200 { success: true, ignored: true }` shape, regardless of timestamps.
+  // Models a deterministic "stale write" run for bounded-retry-exhaustion tests.
+  forceIgnoredWrites?: number
+  // Runs once, on the first forced-ignored POST, so a test can mutate `state` to model
+  // a concurrent writer's change landing between this plugin's GET and its (ignored)
+  // POST — proving a retry re-fetches and merges instead of reusing stale state.
+  onFirstForcedIgnore?: (state: any) => void
+}
+
+function createFolderApiMock(options: FolderApiMockOptions = {}): FolderApiMock {
+  let state: any = { version: 1, rev: 0, foldersMap: {}, collapsedFolderIds: [], updatedAt: 0 }
   let getCalls = 0
   let postCalls = 0
+  let ignoredRemaining = options.forceIgnoredWrites ?? 0
+  let firstForcedIgnoreFired = false
 
   const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString()
@@ -27,14 +40,31 @@ function createFolderApiMock(): FolderApiMock {
     if (method === "POST") {
       postCalls += 1
       const body = JSON.parse(init!.body as string)
-      if (body.baseRev !== state.rev) return new Response(null, { status: 409 })
+
+      if (ignoredRemaining > 0) {
+        ignoredRemaining -= 1
+        if (!firstForcedIgnoreFired) {
+          firstForcedIgnoreFired = true
+          options.onFirstForcedIgnore?.(state)
+        }
+        return new Response(JSON.stringify({ success: true, ignored: true }), { status: 200 })
+      }
+
+      // Real server semantics (see openchamber routes.js): last-write-wins by
+      // `updatedAt`, not `baseRev` (the server never reads `baseRev` and never
+      // returns 409). A write whose `updatedAt` is not strictly newer than the
+      // stored one is silently ignored with HTTP 200.
+      if (typeof state.updatedAt === "number" && state.updatedAt >= body.updatedAt) {
+        return new Response(JSON.stringify({ success: true, ignored: true }), { status: 200 })
+      }
       state = {
         version: body.version,
         rev: state.rev + 1,
         foldersMap: body.foldersMap,
         collapsedFolderIds: body.collapsedFolderIds,
+        updatedAt: body.updatedAt,
       }
-      return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      return new Response(JSON.stringify({ success: true }), { status: 200 })
     }
     throw new Error(`Unexpected fetch method: ${method}`)
   }) as unknown as typeof fetch
@@ -220,5 +250,67 @@ describe("opencode-session-autofile", () => {
 
     expect(errorSpy).toHaveBeenCalled()
     expect(folderApi.postCallCount()).toBe(0)
+  })
+
+  test("HTTP 200 ignored:true retries after refetching, preserving a concurrent folder change", async () => {
+    // Model the real server's last-write-wins-by-timestamp check: a "concurrent
+    // writer" has just stored a slightly-future updatedAt plus its own folder, so our
+    // first write (computed from state we already fetched) lands stale and is
+    // silently ignored with HTTP 200. The retry's delay (WRITE_RETRY_DELAY_MS) must
+    // let real wall-clock time pass the stale threshold, and the retry's refetch must
+    // pick up and preserve the concurrent writer's folder rather than clobbering it.
+    folderApi = createFolderApiMock()
+    globalThis.fetch = folderApi.fetchMock
+    const initialState = folderApi.getState()
+    initialState.updatedAt = Date.now() + 30
+    initialState.foldersMap["/proj"] = [
+      { id: "concurrent-1", name: "Other", sessionIds: ["ses_other"], createdAt: Date.now(), parentId: null },
+    ]
+
+    const hooks = await plugin(makeInput(async () => ({ data: undefined })), {
+      apiBaseUrl: "http://localhost:9999",
+    })
+
+    await hooks.event!({
+      event: {
+        type: "session.updated",
+        properties: { info: session({ id: "ses_8", directory: "/proj", title: "Fix the bug [Tech]" }) },
+      } as any,
+    })
+
+    expect(folderApi.postCallCount()).toBe(2)
+    expect(folderApi.getCallCount()).toBe(2)
+    const folders = folderApi.getState().foldersMap["/proj"]
+    const other = folders.find((f: any) => f.name === "Other")
+    const tech = folders.find((f: any) => f.name === "Tech")
+    expect(other?.sessionIds).toEqual(["ses_other"])
+    expect(tech?.sessionIds).toEqual(["ses_8"])
+  })
+
+  test("bounded exhaustion: writes ignored on every attempt stop after MAX_WRITE_ATTEMPTS, fail open, and leave the session retryable", async () => {
+    folderApi = createFolderApiMock({ forceIgnoredWrites: 3 })
+    globalThis.fetch = folderApi.fetchMock
+
+    const hooks = await plugin(makeInput(async () => ({ data: undefined })), {
+      apiBaseUrl: "http://localhost:9999",
+    })
+    const info = session({ id: "ses_9", directory: "/proj", title: "Fix the bug [Tech]" })
+
+    await expect(
+      hooks.event!({ event: { type: "session.updated", properties: { info } } as any }),
+    ).resolves.toBeUndefined()
+
+    expect(folderApi.postCallCount()).toBe(3)
+    expect(folderApi.getCallCount()).toBe(3)
+    expect(errorSpy).toHaveBeenCalled()
+    expect(folderApi.getState().foldersMap["/proj"] ?? []).toHaveLength(0)
+
+    // Recovery: the session was never added to resolvedSessions, so a later
+    // session.idle fallback (or another session.updated) can still file it once
+    // writes stop being ignored.
+    await hooks.event!({ event: { type: "session.updated", properties: { info } } as any })
+    expect(folderApi.postCallCount()).toBe(4)
+    const folders = folderApi.getState().foldersMap["/proj"]
+    expect(folders.find((f: any) => f.name === "Tech")?.sessionIds).toEqual(["ses_9"])
   })
 })

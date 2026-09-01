@@ -47,6 +47,8 @@ Once this package is published to npm, choose **From npm**, use `opencode-sessio
 
 The plugin recognizes mapped square-bracket tags anywhere in a title, including before a scheduler-added timestamp such as `Morning sales brief [Sales] 2026-08-28 06:00`. Unknown labels and `[Unfiled]` do nothing. A mapped destination folder is created if it does not exist. Duplicate matching folder names are skipped safely. A filing failure never blocks the chat.
 
+Writes to `/api/session-folders` are protected against silent loss from concurrent writers: OpenChamber's real conflict signal is not HTTP 409 but an `HTTP 200 { success: true, ignored: true }` body (its store is last-write-wins by timestamp, not by a `baseRev`/`rev` field). The plugin treats `ignored: true` the same as a 409 — it re-fetches the latest folder state and retries the merge, bounded to 3 attempts total with a short delay between retries.
+
 ## Development
 
 ```bash
