@@ -287,6 +287,70 @@ describe("opencode-session-autofile", () => {
     expect(tech?.sessionIds).toEqual(["ses_8"])
   })
 
+  test("mappings: flat string mapping resolves to a custom folder name", async () => {
+    const hooks = await plugin(makeInput(async () => ({ data: undefined })), {
+      apiBaseUrl: "http://localhost:9999",
+      mappings: { Sales: "Client work" },
+    })
+
+    await hooks.event!({
+      event: {
+        type: "session.updated",
+        properties: { info: session({ id: "ses_flat", directory: "/proj", title: "Follow up [Sales]" }) },
+      } as any,
+    })
+
+    const folders = folderApi.getState().foldersMap["/proj"]
+    expect(folders).toHaveLength(1)
+    expect(folders[0].name).toBe("Client work")
+    expect(folders[0].sessionIds).toEqual(["ses_flat"])
+  })
+
+  test("mappings: legacy { folderName } object form still resolves", async () => {
+    const hooks = await plugin(makeInput(async () => ({ data: undefined })), {
+      apiBaseUrl: "http://localhost:9999",
+      mappings: { Language: { folderName: "Legacy Language" } },
+    })
+
+    await hooks.event!({
+      event: {
+        type: "session.updated",
+        properties: { info: session({ id: "ses_legacy", directory: "/proj", title: "Verb drill [Language]" }) },
+      } as any,
+    })
+
+    const folders = folderApi.getState().foldersMap["/proj"]
+    expect(folders).toHaveLength(1)
+    expect(folders[0].name).toBe("Legacy Language")
+    expect(folders[0].sessionIds).toEqual(["ses_legacy"])
+  })
+
+  test("mappings: invalid values are ignored and never trigger a folder move", async () => {
+    const hooks = await plugin(makeInput(async () => ({ data: undefined })), {
+      apiBaseUrl: "http://localhost:9999",
+      mappings: {
+        Empty: "",
+        Numeric: 123,
+        Nullish: null,
+        EmptyObject: {},
+        BadObject: { folderName: "" },
+      } as any,
+    })
+
+    for (const label of ["Empty", "Numeric", "Nullish", "EmptyObject", "BadObject"]) {
+      await hooks.event!({
+        event: {
+          type: "session.updated",
+          properties: { info: session({ id: `ses_${label}`, directory: "/proj", title: `Untitled [${label}]` }) },
+        } as any,
+      })
+    }
+
+    expect(folderApi.getCallCount()).toBe(0)
+    expect(folderApi.postCallCount()).toBe(0)
+    expect(folderApi.getState().foldersMap["/proj"] ?? []).toHaveLength(0)
+  })
+
   test("bounded exhaustion: writes ignored on every attempt stop after MAX_WRITE_ATTEMPTS, fail open, and leave the session retryable", async () => {
     folderApi = createFolderApiMock({ forceIgnoredWrites: 3 })
     globalThis.fetch = folderApi.fetchMock

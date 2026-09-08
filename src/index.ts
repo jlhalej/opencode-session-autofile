@@ -15,12 +15,14 @@ type FolderState = {
   collapsedFolderIds?: string[]
 }
 
-type Mapping = { folderName: string }
+// Preferred shape: `{ "Label": "Folder Name" }`. Also accepted for backward
+// compatibility with pre-0.4 configs: `{ "Label": { "folderName": "Folder Name" } }`.
+type MappingValue = string | { folderName: string }
 
 export type SessionAutofileOptions = {
   enabled?: boolean
   apiBaseUrl?: string
-  mappings?: Record<string, Mapping>
+  mappings?: Record<string, MappingValue>
   titlePrompt?: string
   fallbackMaxAttempts?: number
   fallbackDelayMs?: number
@@ -32,16 +34,16 @@ const TAG = /\[([^\]\r\n]{1,40})\]/g
 const DEFAULT_FALLBACK_MAX_ATTEMPTS = 3
 const DEFAULT_FALLBACK_DELAY_MS = 500
 
-const DEFAULT_MAPPINGS: Record<string, Mapping> = {
-  Language: { folderName: "Language" },
-  Tech: { folderName: "Tech" },
-  Personal: { folderName: "Personal" },
-  Business: { folderName: "Business" },
-  Sales: { folderName: "Sales" },
-  Career: { folderName: "Career" },
-  Finance: { folderName: "Finance" },
-  Immigration: { folderName: "Immigration" },
-  Artist: { folderName: "Artist" },
+const DEFAULT_MAPPINGS: Record<string, string> = {
+  Language: "Language",
+  Tech: "Tech",
+  Personal: "Personal",
+  Business: "Business",
+  Sales: "Sales",
+  Career: "Career",
+  Finance: "Finance",
+  Immigration: "Immigration",
+  Artist: "Artist",
 }
 
 const DEFAULT_TITLE_PROMPT = `You generate short, descriptive titles for conversations. Respond with ONLY the title text — no explanation, quotes, or ending punctuation.
@@ -65,15 +67,33 @@ function log(message: string, detail?: unknown) {
   console.error("[session-autofile]", message, detail ?? "")
 }
 
-function resolveOptions(options: Record<string, unknown>): Required<Pick<SessionAutofileOptions, "enabled" | "apiBaseUrl" | "titlePrompt" | "fallbackMaxAttempts" | "fallbackDelayMs">> & { mappings: Record<string, Mapping> } {
-  const mappings = options.mappings
+// Normalizes user-supplied mappings to `{ label: folderName }`, accepting both the
+// preferred flat string form and the legacy `{ folderName }` object form per entry.
+// Any entry that is neither is dropped rather than causing an unexpected folder move.
+function normalizeMappings(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return DEFAULT_MAPPINGS
+  const result: Record<string, string> = {}
+  for (const [label, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === "string") {
+      if (value.trim()) result[label] = value.trim()
+      continue
+    }
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const folderName = (value as { folderName?: unknown }).folderName
+      if (typeof folderName === "string" && folderName.trim()) result[label] = folderName.trim()
+    }
+  }
+  return result
+}
+
+function resolveOptions(options: Record<string, unknown>): Required<Pick<SessionAutofileOptions, "enabled" | "apiBaseUrl" | "titlePrompt" | "fallbackMaxAttempts" | "fallbackDelayMs">> & { mappings: Record<string, string> } {
   const fallbackMaxAttempts = options.fallbackMaxAttempts
   const fallbackDelayMs = options.fallbackDelayMs
   return {
     enabled: options.enabled !== false,
     apiBaseUrl: typeof options.apiBaseUrl === "string" && options.apiBaseUrl.trim() ? options.apiBaseUrl : "http://localhost:3000",
     titlePrompt: typeof options.titlePrompt === "string" && options.titlePrompt.trim() ? options.titlePrompt.trim() : DEFAULT_TITLE_PROMPT,
-    mappings: mappings && typeof mappings === "object" && !Array.isArray(mappings) ? mappings as Record<string, Mapping> : DEFAULT_MAPPINGS,
+    mappings: normalizeMappings(options.mappings),
     fallbackMaxAttempts: typeof fallbackMaxAttempts === "number" && Number.isInteger(fallbackMaxAttempts) && fallbackMaxAttempts >= 1 && fallbackMaxAttempts <= 10 ? fallbackMaxAttempts : DEFAULT_FALLBACK_MAX_ATTEMPTS,
     fallbackDelayMs: typeof fallbackDelayMs === "number" && Number.isFinite(fallbackDelayMs) && fallbackDelayMs >= 0 && fallbackDelayMs <= 5_000 ? fallbackDelayMs : DEFAULT_FALLBACK_DELAY_MS,
   }
@@ -90,14 +110,14 @@ function parseLabels(title: string): string[] {
 type Classification =
   | { status: "no-tag" }
   | { status: "unmapped"; label: string }
-  | { status: "mapped"; label: string; mapping: Mapping }
+  | { status: "mapped"; label: string; folderName: string }
 
-function classifyTitle(title: string, mappings: Record<string, Mapping>): Classification {
+function classifyTitle(title: string, mappings: Record<string, string>): Classification {
   const labels = parseLabels(title)
   if (labels.length > 0) {
     for (const label of labels) {
-      const mapping = mappings[label]
-      if (mapping?.folderName?.trim()) return { status: "mapped", label, mapping }
+      const folderName = mappings[label]
+      if (typeof folderName === "string" && folderName.trim()) return { status: "mapped", label, folderName: folderName.trim() }
     }
     return { status: "unmapped", label: labels[0] }
   }
@@ -205,9 +225,9 @@ export default (async (input, options = {}) => {
           return
         }
 
-        const result = await moveSession(config.apiBaseUrl, data.directory, data.id, classification.mapping.folderName)
+        const result = await moveSession(config.apiBaseUrl, data.directory, data.id, classification.folderName)
         resolvedSessions.add(sessionID)
-        log(`fallback ${result}`, { sessionID, label: classification.label, folderName: classification.mapping.folderName })
+        log(`fallback ${result}`, { sessionID, label: classification.label, folderName: classification.folderName })
         return
       }
     } catch (error) {
@@ -231,9 +251,9 @@ export default (async (input, options = {}) => {
           const info = event.properties.info
           const classification = classifyTitle(info.title, config.mappings)
           if (classification.status !== "mapped" || !info.id || !info.directory) return
-          const result = await moveSession(config.apiBaseUrl, info.directory, info.id, classification.mapping.folderName)
+          const result = await moveSession(config.apiBaseUrl, info.directory, info.id, classification.folderName)
           resolvedSessions.add(info.id)
-          log(result, { sessionID: info.id, label: classification.label, folderName: classification.mapping.folderName })
+          log(result, { sessionID: info.id, label: classification.label, folderName: classification.folderName })
         } catch (error) {
           log("filing failed; chat continues", error instanceof Error ? error.message : error)
         }
