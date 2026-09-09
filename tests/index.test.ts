@@ -306,25 +306,6 @@ describe("opencode-session-autofile", () => {
     expect(folders[0].sessionIds).toEqual(["ses_flat"])
   })
 
-  test("mappings: legacy { folderName } object form still resolves", async () => {
-    const hooks = await plugin(makeInput(async () => ({ data: undefined })), {
-      apiBaseUrl: "http://localhost:9999",
-      mappings: { Language: { folderName: "Legacy Language" } },
-    })
-
-    await hooks.event!({
-      event: {
-        type: "session.updated",
-        properties: { info: session({ id: "ses_legacy", directory: "/proj", title: "Verb drill [Language]" }) },
-      } as any,
-    })
-
-    const folders = folderApi.getState().foldersMap["/proj"]
-    expect(folders).toHaveLength(1)
-    expect(folders[0].name).toBe("Legacy Language")
-    expect(folders[0].sessionIds).toEqual(["ses_legacy"])
-  })
-
   test("mappings: invalid values are ignored and never trigger a folder move", async () => {
     const hooks = await plugin(makeInput(async () => ({ data: undefined })), {
       apiBaseUrl: "http://localhost:9999",

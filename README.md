@@ -24,31 +24,19 @@ With a mapping of `{ "Sales": "Client work" }`, a session titled `Follow up with
 
 Title updates can occasionally arrive out of order at session start, so the plugin also does a bounded double-check when a session goes idle: it re-reads the session's current title a few times with a short delay and files it then if the first attempt was missed. This is a safety net, not the primary mechanism — most sessions file immediately.
 
+## Requirements
+
+- **OpenCode**, with plugin hooks and the `session.updated`/`session.idle` events (see [Compatibility](#compatibility)).
+- **OpenChamber running and reachable**, since the plugin calls its `/api/session-folders` API to read and move sessions between folders. By default OpenChamber's web server listens on `http://localhost:3000`; if yours runs elsewhere, set `apiBaseUrl` accordingly (see Configuration below). If OpenChamber isn't reachable, filing attempts fail silently and are logged — they never block the chat.
+
 ## Install from the OpenChamber plugin screen
 
-### From local path — available now
+1. In OpenChamber's **Add plugin** screen, choose **From npm**.
+2. Set **Spec** to `opencode-session-autofile@latest`.
+3. Select **User** to enable it for every local workspace, or **Project** for only the current workspace.
+4. Optionally provide the JSON configuration below, then add the plugin and restart OpenCode.
 
-1. Clone and build this repository, then note the path where you cloned it. Example (adjust to your own location):
-
-   ```bash
-   git clone https://github.com/jlhalej/opencode-session-autofile.git
-   cd opencode-session-autofile
-   bun install && bun run build
-   ```
-
-2. In OpenChamber's **Add plugin** screen, choose **From local path**.
-3. Set **Spec** to the absolute path to `dist/index.js` inside your clone, for example:
-
-   ```text
-   /path/to/opencode-session-autofile/dist/index.js
-   ```
-
-4. Select **User** to enable it for every local workspace, or **Project** for only the current workspace.
-5. Optionally provide the JSON configuration below, then add the plugin and restart OpenCode.
-
-### From npm — after publication
-
-Once this package is published to npm, choose **From npm**, use `opencode-session-autofile@latest` as the **Spec**, provide options if desired, and restart OpenCode.
+Adding the plugin replaces OpenCode's native `title` agent prompt with the plugin's own tagging prompt (or your custom `titlePrompt`, if set). This happens automatically every time OpenCode starts with the plugin enabled — not just once at install — so the title agent always stays in sync with your current `mappings`/`titlePrompt` configuration.
 
 ## Configuration
 
@@ -65,18 +53,9 @@ The `mappings` option is a flat JSON object: each key is the tag OpenCode writes
 }
 ```
 
-| Option | Default | Purpose |
-| --- | --- | --- |
-| `enabled` | `true` | Kill switch for filing; the title prompt still loads. |
-| `apiBaseUrl` | `http://localhost:3000` | OpenChamber API base URL. |
-| `mappings` | Built-in domain list (see `src/index.ts`) | Tag → destination-folder name. Unrecognized keys/values are safely ignored. |
-| `titlePrompt` | Built-in suffix prompt | Full replacement prompt for OpenCode's native `title` agent. |
-| `fallbackMaxAttempts` | `3` | Max bounded re-checks of a session's title on idle, if the primary filing attempt was missed. |
-| `fallbackDelayMs` | `500` | Delay between fallback re-checks, in milliseconds. |
-
 A tag is recognized anywhere in the title, including before a scheduler-added timestamp such as `Morning sales brief [Sales] 2026-08-28 06:00`. A mapping entry that isn't a non-empty string is ignored rather than causing an unexpected move.
 
-**Legacy format:** older configs using a nested object per entry, `{ "Language": { "folderName": "Language" } }`, are still accepted for backward compatibility, but the flat string format above is preferred for new configurations.
+For less common options (`enabled`, `titlePrompt`, `fallbackMaxAttempts`, `fallbackDelayMs`), see [ADVANCED.md](ADVANCED.md).
 
 ## Safety and behavior notes
 

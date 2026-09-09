@@ -15,14 +15,10 @@ type FolderState = {
   collapsedFolderIds?: string[]
 }
 
-// Preferred shape: `{ "Label": "Folder Name" }`. Also accepted for backward
-// compatibility with pre-0.4 configs: `{ "Label": { "folderName": "Folder Name" } }`.
-type MappingValue = string | { folderName: string }
-
 export type SessionAutofileOptions = {
   enabled?: boolean
   apiBaseUrl?: string
-  mappings?: Record<string, MappingValue>
+  mappings?: Record<string, string>
   titlePrompt?: string
   fallbackMaxAttempts?: number
   fallbackDelayMs?: number
@@ -67,21 +63,13 @@ function log(message: string, detail?: unknown) {
   console.error("[session-autofile]", message, detail ?? "")
 }
 
-// Normalizes user-supplied mappings to `{ label: folderName }`, accepting both the
-// preferred flat string form and the legacy `{ folderName }` object form per entry.
-// Any entry that is neither is dropped rather than causing an unexpected folder move.
+// Normalizes user-supplied mappings to `{ label: folderName }`. Any entry whose value
+// isn't a non-empty string is dropped rather than causing an unexpected folder move.
 function normalizeMappings(raw: unknown): Record<string, string> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return DEFAULT_MAPPINGS
   const result: Record<string, string> = {}
   for (const [label, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof value === "string") {
-      if (value.trim()) result[label] = value.trim()
-      continue
-    }
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      const folderName = (value as { folderName?: unknown }).folderName
-      if (typeof folderName === "string" && folderName.trim()) result[label] = folderName.trim()
-    }
+    if (typeof value === "string" && value.trim()) result[label] = value.trim()
   }
   return result
 }
