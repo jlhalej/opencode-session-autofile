@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode/plugin"
 import { createHash } from "node:crypto"
 import { mkdir, writeFile } from "node:fs/promises"
 
@@ -27,33 +27,37 @@ export type SessionAutofileOptions = {
   reconcileIntervalMs?: number
 }
 
-// Minimal shape the periodic reconciliation reads off a `Session`. The installed
-// `@opencode-ai/sdk` version's `Session` type omits `time.archived` even though the
-// server sends it (OpenChamber's own client reads `session.time?.archived` the same
-// way — see `packages/ui/src/sync/event-reducer.ts`), so this is declared locally
-// rather than trusting the SDK's stale type.
-type SessionSummary = {
+// Minimal shape this plugin needs off a session, read from `ctx.session.get()`'s
+// `SessionInfo` (OpenCode 2 / `@opencode/plugin@2.0.25`). V1 had a flat `directory`
+// field; V2 nests it under `location.directory` (`LocationPublicRef`). `time.archived`
+// kept the same name and shape across both majors.
+type SessionInfoLike = {
   id: string
-  directory?: string
-  title: string
+  title?: string
+  location?: { directory?: string }
   time?: { archived?: number }
 }
 
-// The installed `@opencode-ai/sdk` version's generated `SessionListData.query` type
-// only declares `directory`. The live `/session` route (confirmed against opencode
-// v1.18.32's HttpApi `ListQuery` schema and its `SessionHttpApi.list` handler) also
-// accepts `scope: "project"`, which tells the server to ignore the directory filter
-// for session selection and return every session in the project, including every git
-// worktree, and a numeric `limit` (server default 100 when omitted). Deliberately NOT
-// using `roots: true`: Hugo's requirement is that every title-tagged session gets
-// reconciled, including child/subagent sessions, not just top-level ones — the sweep
-// must be a true superset of what the event-driven paths already file one at a time.
-// `directory` is kept even under `scope: "project"` since the same value is also how
-// `createOpencodeClient` derives the `x-opencode-directory` request header that
-// instance/project routing reads — dropping it from the query costs nothing to avoid.
-// Declared locally and cast at the call site rather than trusting the stale generated
-// type.
-type ReconcileListQuery = { scope: "project"; limit: number; directory?: string }
+// `ctx.session` in `@opencode/plugin@2.0.25`'s Promise context (`SessionDomain` in
+// `dist/promise/session.d.ts`) deliberately `Pick`s a subset of the full client's
+// `SessionApi` — `list` and `active` are NOT in that Pick, unlike V1's
+// `PluginInput.client.session`, which had `list`. Confirmed by reading the type
+// directly, not inferred from a runtime error. There is no other documented way to
+// enumerate project sessions from inside a Promise plugin's `setup(ctx)` (no
+// `serverUrl`/raw client escape hatch on `Context`, unlike V1's `PluginInput`).
+// Periodic reconciliation is therefore gated behind this runtime capability check,
+// exactly like V1 already gated it behind a stale-SDK-type concern — if a future
+// `@opencode/plugin` release adds `list` back, this activates with no plugin code
+// changes. Today, on OpenCode 2.0.25, this is always `false`: reconciliation does not
+// run under the V2 contract, and only the two event-driven paths (immediate
+// classify-on-rename/create, bounded retry on turn-end) file sessions. See
+// `oc-plugin-autofile.architecture.md` for the operational implication.
+type ReconcileCapableSession = {
+  list: (input: { project?: string; limit?: number; cursor?: string }) => Promise<{
+    data: SessionInfoLike[]
+    cursor?: { next?: string | null }
+  }>
+}
 
 const MAX_WRITE_ATTEMPTS = 3
 const WRITE_RETRY_DELAY_MS = 50
@@ -66,36 +70,23 @@ const MAX_RECONCILE_INTERVAL_MS = 86_400_000
 // Startup pass runs once shortly after the plugin loads, not immediately: firing back
 // into a server that is still booting risks re-entrancy.
 const RECONCILE_STARTUP_DELAY_MS = 20_000
-// Caps *moves* (writes), not the scan: `session.list` gives no ordering guarantee, so
-// capping how many sessions get scanned per tick could let the same prefix win every
-// tick while the tail never gets filed. Scanning/classifying is local and cheap;
-// only the write side needs a per-tick bound. Sessions beyond the cap stay in the
-// misfiled set and are picked up on a later tick (or by the primary event path first).
+// Caps *moves* (writes), not the scan: a huge backlog shouldn't monopolize one tick.
 const RECONCILE_MAX_MOVES_PER_TICK = 25
-// `/session` defaults to `limit: 100` server-side and has no cursor for paging past
-// that (confirmed against opencode v1.18.32's `Session.list`/`listByProject`: `start`
-// only filters by `updated >= start`, it isn't a `before`/page cursor). A first try at
-// `RECONCILE_LIST_LIMIT` covers ordinary session counts in a single request; only
-// projects at or beyond that size pay for a second, larger request.
+// Page size per `session.list` request, if the capability exists.
 const RECONCILE_LIST_LIMIT = 200
-// Hard ceiling on the escalated retry — never ask for an unbounded number of rows in
-// one tick. Since the sweep now includes every session (not just root sessions), a
-// single long-lived, actively-used project can realistically approach or pass a
-// four-figure session count well before this plugin is uninstalled; 5,000 gives real
-// headroom above that without being unbounded. If even this comes back exactly full,
-// `possiblyIncomplete` is set instead of silently treating whatever was fetched as the
-// whole project — there is no way to page further in one `/session` request (see
-// ADVANCED.md).
+// Overall cap on sessions scanned in one tick across every page. V1 could only guess
+// at "possibly incomplete" by re-requesting once at an escalated limit, since its SDK
+// build had no page cursor. V2's `SessionsResponse.cursor.next` (if `list` exists)
+// supports real pagination, so this cap now bounds genuine enumeration instead of a
+// single best-effort request — `possiblyIncomplete` is only set if the cap is hit
+// while a next page still exists.
 const RECONCILE_LIST_LIMIT_ESCALATED = 5_000
 
 // Guards against two reconciliation ticks running concurrently, process-wide (not
 // per directory/instance): every instance's sweep writes the same full-snapshot
 // `/api/session-folders` blob, so two concurrent sweeps' read-modify-write cycles
-// could each discard the other's moves even with the `ignored: true` retry (that
-// retry only catches a write being stale against the *current* server state, not two
-// near-simultaneous writers each computing their merge against a state the other is
-// about to replace). Kept at module scope, not inside the plugin factory closure, so
-// it applies across every directory/worktree's copy of this plugin in one process.
+// could each discard the other's moves. Kept at module scope so it applies across
+// every directory/worktree's copy of this plugin in one process.
 let reconciling = false
 
 const DEFAULT_MAPPINGS: Record<string, string> = {
@@ -194,12 +185,19 @@ async function getFolderState(apiBaseUrl: string): Promise<FolderState> {
   return state as FolderState
 }
 
-// The server accepts the write with HTTP 200 but silently drops it (`{ success: true,
-// ignored: true }`) when its stored state is already at least as fresh as our
-// `updatedAt`. That is a real conflict, not a success: our merge was computed against
-// state that a concurrent writer has since superseded. Treat it exactly like a 409 so
-// the caller re-fetches the latest state and retries instead of reporting the move as
-// done.
+// OpenChamber 1.24.2's server accepted the write with HTTP 200 but silently dropped it
+// (`{ success: true, ignored: true }`) when its stored state was already at least as
+// fresh as our `updatedAt` (last-write-wins by timestamp). OpenChamber 2.1.1 changed
+// this route's conflict handling entirely (confirmed by reading the installed
+// `session-folders/routes.js` on `vm-oc-hugoj2` directly, not assumed from the old
+// behavior): POSTs now queue per-process (`saveQueue`) and the server performs its own
+// read-modify-write merge per folder id, unioning session ids only for same-name
+// different-id "twin" folders. It no longer returns `ignored: true` at all, and still
+// never returns `409`. That makes the retry branch below unreachable in practice against
+// 2.1.1 — not harmful (the loop still succeeds on the first attempt), just dead weight
+// kept so this function behaves identically against either OpenChamber version without
+// a version check. If a future OpenChamber reintroduces a conflict signal, this still
+// handles it the same way: re-fetch and retry rather than report false success.
 async function writeFolderState(apiBaseUrl: string, state: FolderState, baseRev: number): Promise<"success" | "retry"> {
   const response = await fetch(apiUrl(apiBaseUrl, "/api/session-folders"), {
     method: "POST",
@@ -281,323 +279,319 @@ async function moveSession(apiBaseUrl: string, scope: string, sessionID: string,
   throw new Error("OpenChamber rejected or ignored the write too many times to file the session")
 }
 
-export default (async (input, options = {}) => {
-  const config = resolveOptions(options)
-  // OpenChamber captures plugin stderr in an inaccessible in-memory buffer while
-  // its managed OpenCode process is alive. Keep a small, non-secret status snapshot
-  // outside the synced vault so an operator can tell whether the timer fired and
-  // which folder names this plugin instance actually loaded from Options JSON.
-  const diagnosticDir = "/tmp/opencode-session-autofile"
-  const diagnosticPath = typeof input.directory === "string"
-    ? `${diagnosticDir}/${createHash("sha256").update(input.directory).digest("hex").slice(0, 16)}.json`
-    : null
-  const startedAt = new Date().toISOString()
-  async function diagnostic(phase: string, detail: Record<string, unknown> = {}) {
-    if (!diagnosticPath) return
-    try {
-      await mkdir(diagnosticDir, { recursive: true })
-      await writeFile(diagnosticPath, JSON.stringify({
-        pid: process.pid,
-        directory: input.directory,
-        startedAt,
-        recordedAt: new Date().toISOString(),
-        phase,
-        mappings: config.mappings,
-        ...detail,
-      }, null, 2), { mode: 0o600 })
-    } catch (error) {
-      log("reconcile: could not record diagnostic", error instanceof Error ? error.message : error)
-    }
-  }
-  // Sessions confirmed filed (or confirmed terminally unfiled, e.g. `[Unfiled]`/unmapped
-  // tag) so the fallback stops rechecking them. Session IDs are globally unique, so a
-  // flat set is sufficient without directory scoping.
-  const resolvedSessions = new Set<string>()
-  // Guards against two overlapping fallback retry loops for the same session if
-  // `session.idle` fires again while a loop is already in flight.
-  const pendingFallback = new Set<string>()
+function archivedAt(session: SessionInfoLike): number {
+  return typeof session.time?.archived === "number" ? session.time.archived : 0
+}
 
-  async function runFallback(sessionID: string) {
-    if (!config.enabled || resolvedSessions.has(sessionID) || pendingFallback.has(sessionID)) return
-    pendingFallback.add(sessionID)
-    try {
-      for (let attempt = 0; attempt < config.fallbackMaxAttempts; attempt += 1) {
-        if (attempt > 0) await delay(config.fallbackDelayMs)
-        if (resolvedSessions.has(sessionID)) return
-
-        const { data } = await input.client.session.get({ path: { id: sessionID }, signal: AbortSignal.timeout(5_000) })
-        if (!data?.id || !data.directory) continue
-        if (archivedAt(data as SessionSummary)) {
-          resolvedSessions.add(sessionID)
-          log("fallback: session archived, no folder change", { sessionID })
-          return
-        }
-
-        const classification = classifyTitle(data.title, config.mappings)
-        if (classification.status === "no-tag") continue
-        if (classification.status === "unmapped") {
-          resolvedSessions.add(sessionID)
-          log("fallback: tag unmapped, no folder", { sessionID, label: classification.label })
-          return
-        }
-
-        const result = await moveSession(config.apiBaseUrl, data.directory, data.id, classification.folderName)
-        resolvedSessions.add(sessionID)
-        log(`fallback ${result}`, { sessionID, label: classification.label, folderName: classification.folderName })
-        return
-      }
-    } catch (error) {
-      log("fallback check failed; chat continues", error instanceof Error ? error.message : error)
-    } finally {
-      pendingFallback.delete(sessionID)
-    }
-  }
-
-  // Tag-authoritative periodic reconciliation: independent of the event-driven paths
-  // above, it re-derives every mapped session's folder from its *current* title and
-  // moves it if that's not where it currently sits — including sessions that started
-  // in the right folder and were since moved elsewhere by hand. Unlike the fallback
-  // (which only fires once, near session start, to catch a missed event), this runs
-  // on its own schedule for the lifetime of the process. Sessions with no tag or an
-  // unmapped tag are left untouched, same as the event-driven paths: this plugin only
-  // ever files, never unfiles.
-  let reconcileTimer: ReturnType<typeof setTimeout> | undefined
-  // Session-idle is a secondary wake-up source: if the timer is delayed or an
-  // instance starts only when the first session is used, an idle event can still
-  // initiate a pass. The normal interval prevents a pass on every turn.
-  let lastReconcileAt = 0
-  // Set once by `dispose` (OpenCode disposes and reloads plugin instances on config
-  // changes). Checked before scheduling the next tick, at tick start, and before each
-  // move, so a sweep already in flight at dispose time can't reschedule itself or keep
-  // writing through a client that may since have been torn down.
-  let disposed = false
-
-  function archivedAt(session: SessionSummary): number {
-    return typeof session.time?.archived === "number" ? session.time.archived : 0
-  }
-
-  // Tries `RECONCILE_LIST_LIMIT` first (covers ordinary session counts in one
-  // request); only escalates to `RECONCILE_LIST_LIMIT_ESCALATED` if the project has at
-  // least that many sessions (root and child sessions both count — see
-  // `ReconcileListQuery`). `scope: "project"` means this already spans every worktree
-  // of the project, not just `input.directory`. Throws rather than returning an empty
-  // list on failure: a rejected/failed call must surface as a failed tick (counted and
-  // logged as such by the caller), not as a false "swept zero sessions, nothing to do".
-  async function listProjectSessions(): Promise<{ sessions: SessionSummary[]; possiblyIncomplete: boolean }> {
-    let sessions: SessionSummary[] = []
-    for (const limit of [RECONCILE_LIST_LIMIT, RECONCILE_LIST_LIMIT_ESCALATED]) {
-      const query: ReconcileListQuery = { scope: "project", limit, directory: input.directory }
-      const { data, error } = await input.client.session.list({
-        query: query as unknown as { directory?: string },
-        signal: AbortSignal.timeout(10_000),
-      })
-      if (!Array.isArray(data)) {
-        throw new Error(`session.list failed${error ? `: ${JSON.stringify(error)}` : ""}`)
-      }
-      sessions = data as SessionSummary[]
-      if (sessions.length < limit) return { sessions, possiblyIncomplete: false }
-    }
-    // Even the escalated cap came back exactly full: this project may have more
-    // sessions than we're willing to fetch in one tick.
-    return { sessions, possiblyIncomplete: true }
-  }
-
-  // Checked once at load, not per tick: this SDK build either has `session.list` or it
-  // doesn't, and re-logging "unavailable" every tick would be noise (and would
-  // contradict the one-time note in the README/ADVANCED docs).
-  const reconciliationSupported = typeof input.client?.session?.list === "function"
-  if (!reconciliationSupported) {
-    log("reconcile: client.session.list unavailable on this SDK build; periodic reconciliation disabled")
-  }
-  if (config.enabled) void diagnostic("initialized", { reconciliationSupported })
-
-  async function reconcileTick(): Promise<void> {
-    if (!config.enabled || disposed) return
-    // Single process-wide lock, not one per plugin instance/directory: every
-    // instance's `moveSession` writes the *same* full-snapshot `/api/session-folders`
-    // blob (just under different `foldersMap` scope keys), and the `ignored: true`
-    // retry only protects a single writer's own stale write — it does not stop two
-    // concurrent sweeps' read-modify-write cycles from each silently discarding the
-    // other's moves. Serializing every instance's sweep avoids that entirely; the cost
-    // is that a slow sweep in one directory can make another directory's tick skip and
-    // wait for its own next interval, which just means that directory heals one tick
-    // later, not that it's ever wrong. This only serializes sweeps against each other:
-    // it does not serialize against the primary/fallback event-driven writes or
-    // against OpenChamber's own UI writes, which still rely on the existing
-    // read-refetch-retry protection in `moveSession`/`writeFolderState` to converge
-    // rather than to never collide.
-    if (reconciling) {
-      log("reconcile: another instance's pass is running, skipping this tick", { directory: input.directory })
-      await diagnostic("skipped: another instance is reconciling")
-      return
-    }
-    reconciling = true
-    lastReconcileAt = Date.now()
-    await diagnostic("running")
-    // `missingMetadata` and `inFlight` exist so `listed` always equals the sum of every
-    // bucket below — an honest per-tick accounting instead of a count that silently
-    // undercounts sessions the sweep saw but couldn't classify or chose to defer to
-    // another in-flight path.
-    const stats = { listed: 0, missingMetadata: 0, archivedSkipped: 0, inFlight: 0, untaggedOrUnmapped: 0, alreadyFiled: 0, moved: 0, deferred: 0, ambiguous: 0, failed: 0 }
-    let possiblyIncomplete = false
-    let phase = "completed"
-    let failure: string | undefined
-    let firstMoveFailure: string | undefined
-    try {
-      const listResult = await listProjectSessions()
-      const sessions = listResult.sessions
-      possiblyIncomplete = listResult.possiblyIncomplete
-      if (possiblyIncomplete) {
-        log("reconcile: project session count may exceed the fetch cap; this tick's coverage is NOT guaranteed complete", {
-          directory: input.directory,
-          cap: RECONCILE_LIST_LIMIT_ESCALATED,
-        })
-      }
-      stats.listed = sessions.length
-
-      let folderState: FolderState
+export default {
+  id: "opencode-session-autofile",
+  async setup(ctx) {
+    const config = resolveOptions(ctx.options)
+    // OpenChamber captures plugin stderr in an inaccessible in-memory buffer while
+    // its managed OpenCode process is alive. Keep a small, non-secret status snapshot
+    // outside the synced vault so an operator can tell whether the timer fired and
+    // which folder names this plugin instance actually loaded from Options JSON.
+    const diagnosticDir = "/tmp/opencode-session-autofile"
+    const diagnosticPath = typeof ctx.location.directory === "string"
+      ? `${diagnosticDir}/${createHash("sha256").update(ctx.location.directory).digest("hex").slice(0, 16)}.json`
+      : null
+    const startedAt = new Date().toISOString()
+    async function diagnostic(phase: string, detail: Record<string, unknown> = {}) {
+      if (!diagnosticPath) return
       try {
-        folderState = await getFolderState(config.apiBaseUrl)
+        await mkdir(diagnosticDir, { recursive: true })
+        await writeFile(diagnosticPath, JSON.stringify({
+          pid: process.pid,
+          directory: ctx.location.directory,
+          opencodeVersion: ctx.app.version,
+          startedAt,
+          recordedAt: new Date().toISOString(),
+          phase,
+          mappings: config.mappings,
+          ...detail,
+        }, null, 2), { mode: 0o600 })
       } catch (error) {
-        phase = "failed: folder API GET"
-        failure = error instanceof Error ? error.message : String(error)
-        log("reconcile: failed to read folder state; skipping tick", error instanceof Error ? error.message : error)
-        return
+        log("reconcile: could not record diagnostic", error instanceof Error ? error.message : error)
       }
-
-      const misfiled: Array<{ sessionID: string; folderName: string; label: string }> = []
-      for (const session of sessions as SessionSummary[]) {
-        if (!session?.id || !session.directory) { stats.missingMetadata += 1; continue }
-        if (archivedAt(session)) { stats.archivedSkipped += 1; continue }
-        // Already being handled by the fallback's own retry loop for this exact
-        // session; let that finish rather than racing it from here.
-        if (pendingFallback.has(session.id)) { stats.inFlight += 1; continue }
-
-        const classification = classifyTitle(session.title ?? "", config.mappings)
-        if (classification.status !== "mapped") { stats.untaggedOrUnmapped += 1; continue }
-
-        const scopedFolders = folderState.foldersMap?.[session.directory] ?? []
-        const placement = classifyPlacement(scopedFolders, session.id, classification.folderName)
-        if (placement === "already-filed") { stats.alreadyFiled += 1; continue }
-        if (placement === "ambiguous") {
-          stats.ambiguous += 1
-          log("reconcile: folder name ambiguous, skipping", { sessionID: session.id, folderName: classification.folderName })
-          continue
-        }
-        misfiled.push({ sessionID: session.id, folderName: classification.folderName, label: classification.label })
-      }
-
-      // Bounded and sequential: bounded so one huge backlog can't monopolize a tick
-      // (the rest simply waits for the next tick), sequential so two concurrent
-      // "folder doesn't exist yet" creates for the same name can't race into two
-      // duplicate folders (which would then read back as `folder-ambiguous` forever).
-      const toMove = misfiled.slice(0, RECONCILE_MAX_MOVES_PER_TICK)
-      stats.deferred = misfiled.length - toMove.length
-
-      for (let i = 0; i < toMove.length; i += 1) {
-        if (disposed) {
-          // Count the un-attempted remainder as deferred rather than leaving it
-          // uncounted, so `listed` still equals the sum of every bucket even when a
-          // sweep is cut short mid-loop by dispose.
-          stats.deferred += toMove.length - i
-          break
-        }
-        const item = toMove[i]!
-        try {
-          // Re-check right before writing, not just during the scan: the fallback's
-          // own retry loop for this exact session may have started in the gap between
-          // the scan above and this item's turn in the (sequential) move loop.
-          if (pendingFallback.has(item.sessionID)) { stats.inFlight += 1; continue }
-          // The list snapshot above can go stale mid-sweep — re-read the session's
-          // live title immediately before writing rather than trusting it, so a
-          // title the primary event path already changed since the snapshot isn't
-          // filed under its old tag.
-          const { data: fresh } = await input.client.session.get({ path: { id: item.sessionID }, signal: AbortSignal.timeout(5_000) })
-          if (!fresh?.id || !fresh.directory) { stats.missingMetadata += 1; continue }
-          if (archivedAt(fresh as SessionSummary)) { stats.archivedSkipped += 1; continue }
-
-          const freshClassification = classifyTitle(fresh.title, config.mappings)
-          if (freshClassification.status !== "mapped") { stats.untaggedOrUnmapped += 1; continue }
-
-          const result = await moveSession(config.apiBaseUrl, fresh.directory, fresh.id, freshClassification.folderName)
-          resolvedSessions.add(fresh.id)
-          if (result === "already-filed") stats.alreadyFiled += 1
-          else if (result === "folder-ambiguous") {
-            stats.ambiguous += 1
-            log("reconcile: folder name ambiguous, skipping", { sessionID: fresh.id, folderName: freshClassification.folderName })
-          } else stats.moved += 1
-        } catch (error) {
-          stats.failed += 1
-          firstMoveFailure ??= error instanceof Error ? error.message : String(error)
-          log("reconcile: failed to file session; continuing sweep", { sessionID: item.sessionID, error: error instanceof Error ? error.message : error })
-        }
-      }
-
-      log("reconcile tick complete", { directory: input.directory, possiblyIncomplete, ...stats })
-    } catch (error) {
-      phase = "failed: session listing or scan"
-      failure = error instanceof Error ? error.message : String(error)
-      log("reconcile tick failed; will retry next interval", error instanceof Error ? error.message : error)
-    } finally {
-      reconciling = false
-      await diagnostic(phase, { possiblyIncomplete, ...stats, ...(failure ? { failure } : {}), ...(firstMoveFailure ? { firstMoveFailure } : {}) })
     }
-  }
 
-  function scheduleReconcile(delayMs: number) {
-    if (!config.enabled || disposed) return
-    reconcileTimer = setTimeout(() => {
-      void reconcileTick().finally(() => scheduleReconcile(config.reconcileIntervalMs))
-    }, delayMs)
-    reconcileTimer.unref?.()
-  }
+    // Replaces OpenCode's native title-generation prompt for every title request,
+    // regardless of provider. V1 did this by rewriting `agent.title.prompt` from the
+    // `config` hook (which V2 does not have). V2 intercepts the title request itself
+    // via `session.hook("title", ...)` (`SessionHooks.title: SessionTitle`, confirmed
+    // in `@opencode/plugin@2.0.25`'s `dist/promise/session.d.ts`) and replaces its
+    // `system` array outright — the model still runs and produces the actual title
+    // text, same as V1; only the instructions it's given change.
+    const titleHook = await ctx.session.hook("title", async (request) => {
+      request.system = [{ type: "text", text: config.titlePrompt }]
+    })
 
-  if (config.enabled && reconciliationSupported) scheduleReconcile(RECONCILE_STARTUP_DELAY_MS)
+    // Sessions confirmed filed (or confirmed terminally unfiled, e.g. `[Unfiled]`/unmapped
+    // tag, or archived) so later events stop rechecking them. Session IDs are globally
+    // unique, so a flat set is sufficient without directory scoping.
+    const resolvedSessions = new Set<string>()
+    // Guards against two overlapping attempts (immediate classify-on-rename and a
+    // bounded retry loop) for the same session running at once.
+    const pendingFallback = new Set<string>()
 
-  return {
-    dispose: async () => {
-      disposed = true
-      if (reconcileTimer) clearTimeout(reconcileTimer)
-      if (config.enabled) await diagnostic("disposed")
-    },
-    config: async (opencodeConfig) => {
-      const mutableConfig = opencodeConfig as typeof opencodeConfig & { agent?: Record<string, Record<string, unknown>> }
-      mutableConfig.agent ??= {}
-      mutableConfig.agent.title = { ...mutableConfig.agent.title, prompt: config.titlePrompt }
-    },
-    event: async ({ event }) => {
-      if (!config.enabled) return
+    // Shared body for both the immediate path (session.created/session.renamed) and
+    // the bounded-retry path (session.execution.*): fetch the session's current state
+    // directly (never trust an event's embedded fields, which in V2 are partial — e.g.
+    // `session.renamed`'s `data` carries only `{title, sessionID}`, no directory or
+    // archived flag), classify its title, and move it if mapped.
+    async function classifyAndFile(info: SessionInfoLike): Promise<"filed" | "archived" | "unmapped" | "no-tag"> {
+      if (archivedAt(info)) {
+        resolvedSessions.add(info.id)
+        log("session archived, no folder change", { sessionID: info.id })
+        return "archived"
+      }
+      const classification = classifyTitle(info.title ?? "", config.mappings)
+      if (classification.status === "no-tag") return "no-tag"
+      if (classification.status === "unmapped") {
+        resolvedSessions.add(info.id)
+        log("tag unmapped, no folder", { sessionID: info.id, label: classification.label })
+        return "unmapped"
+      }
+      const directory = info.location?.directory
+      if (!directory) return "no-tag"
+      const result = await moveSession(config.apiBaseUrl, directory, info.id, classification.folderName)
+      resolvedSessions.add(info.id)
+      log(result, { sessionID: info.id, label: classification.label, folderName: classification.folderName })
+      return "filed"
+    }
 
-      if (event.type === "session.updated") {
-        try {
-          const info = event.properties.info
-          if (!info.id) return
-          if (archivedAt(info as SessionSummary)) {
-            resolvedSessions.add(info.id)
-            return
+    // Immediate path: fires once, with no retry, right when a session is created with
+    // a preset tagged title (scheduler/spawn flows) or its title is renamed by the
+    // native title agent. If the tag isn't there yet (title still default), this is a
+    // no-op and the bounded retry path below is the catch-up mechanism, same as V1's
+    // primary/fallback split.
+    async function attemptFile(sessionID: string) {
+      if (!config.enabled || resolvedSessions.has(sessionID) || pendingFallback.has(sessionID)) return
+      pendingFallback.add(sessionID)
+      try {
+        const info = await ctx.session.get({ sessionID }) as SessionInfoLike
+        await classifyAndFile(info)
+      } catch (error) {
+        log("filing failed; chat continues", error instanceof Error ? error.message : error)
+      } finally {
+        pendingFallback.delete(sessionID)
+      }
+    }
+
+    // Bounded retry path: V1's `session.idle` fired reliably once a turn ended,
+    // regardless of outcome. V2 splits that into three terminal execution events
+    // (`session.execution.succeeded/failed/interrupted`); all three are treated as
+    // "turn ended" to preserve the same "always eventually re-checked" guarantee.
+    async function runFallback(sessionID: string) {
+      if (!config.enabled || resolvedSessions.has(sessionID) || pendingFallback.has(sessionID)) return
+      pendingFallback.add(sessionID)
+      try {
+        for (let attempt = 0; attempt < config.fallbackMaxAttempts; attempt += 1) {
+          if (attempt > 0) await delay(config.fallbackDelayMs)
+          if (resolvedSessions.has(sessionID)) return
+          let info: SessionInfoLike
+          try {
+            info = await ctx.session.get({ sessionID }) as SessionInfoLike
+          } catch {
+            continue
           }
-          const classification = classifyTitle(info.title, config.mappings)
-          if (classification.status !== "mapped" || !info.directory) return
-          const result = await moveSession(config.apiBaseUrl, info.directory, info.id, classification.folderName)
-          resolvedSessions.add(info.id)
-          log(result, { sessionID: info.id, label: classification.label, folderName: classification.folderName })
-        } catch (error) {
-          log("filing failed; chat continues", error instanceof Error ? error.message : error)
+          const outcome = await classifyAndFile(info)
+          if (outcome !== "no-tag") return
         }
+      } catch (error) {
+        log("fallback check failed; chat continues", error instanceof Error ? error.message : error)
+      } finally {
+        pendingFallback.delete(sessionID)
+      }
+    }
+
+    // Tag-authoritative periodic reconciliation — see the `ReconcileCapableSession`
+    // comment above for why this is feature-detected rather than assumed. Ported
+    // verbatim from 0.4.1's logic (list, classify, bounded sequential moves) in case a
+    // future `@opencode/plugin` release restores `session.list`; inert today.
+    let reconcileTimer: ReturnType<typeof setTimeout> | undefined
+    let lastReconcileAt = 0
+    let disposed = false
+
+    async function listProjectSessions(): Promise<{ sessions: SessionInfoLike[]; possiblyIncomplete: boolean }> {
+      const session = ctx.session as unknown as ReconcileCapableSession
+      const sessions: SessionInfoLike[] = []
+      let cursor: string | undefined
+      for (;;) {
+        const page = await session.list({ project: ctx.location.project?.id, limit: RECONCILE_LIST_LIMIT, ...(cursor ? { cursor } : {}) })
+        if (!page || !Array.isArray(page.data)) throw new Error("session.list returned an unexpected shape")
+        sessions.push(...page.data)
+        const next = page.cursor?.next
+        if (!next) return { sessions, possiblyIncomplete: false }
+        if (sessions.length >= RECONCILE_LIST_LIMIT_ESCALATED) return { sessions, possiblyIncomplete: true }
+        cursor = next
+      }
+    }
+
+    const reconciliationSupported = typeof (ctx.session as unknown as ReconcileCapableSession).list === "function"
+    if (!reconciliationSupported) {
+      log("reconcile: session.list unavailable on this OpenCode/plugin build; periodic reconciliation disabled")
+    }
+    if (config.enabled) void diagnostic("initialized", { reconciliationSupported })
+
+    async function reconcileTick(): Promise<void> {
+      if (!config.enabled || disposed) return
+      if (reconciling) {
+        log("reconcile: another instance's pass is running, skipping this tick", { directory: ctx.location.directory })
+        await diagnostic("skipped: another instance is reconciling")
         return
       }
+      reconciling = true
+      lastReconcileAt = Date.now()
+      await diagnostic("running")
+      const stats = { listed: 0, missingMetadata: 0, archivedSkipped: 0, inFlight: 0, untaggedOrUnmapped: 0, alreadyFiled: 0, moved: 0, deferred: 0, ambiguous: 0, failed: 0 }
+      let possiblyIncomplete = false
+      let phase = "completed"
+      let failure: string | undefined
+      let firstMoveFailure: string | undefined
+      try {
+        const listResult = await listProjectSessions()
+        const sessions = listResult.sessions
+        possiblyIncomplete = listResult.possiblyIncomplete
+        if (possiblyIncomplete) {
+          log("reconcile: project session count may exceed the fetch cap; this tick's coverage is NOT guaranteed complete", {
+            directory: ctx.location.directory,
+            cap: RECONCILE_LIST_LIMIT_ESCALATED,
+          })
+        }
+        stats.listed = sessions.length
 
-      // Fallback/catch-up path: `session.updated` delivery for the session's first
-      // real, tagged title can be missed (event timing/ordering at session start).
-      // `session.idle` fires reliably once the turn is over and gives us a sessionID
-      // we can use to pull the session's current title directly, independent of
-      // whether the triggering `session.updated` was ever observed by this plugin.
-      if (event.type === "session.idle") {
-        await runFallback(event.properties.sessionID)
-        if (config.enabled && !disposed && reconciliationSupported && Date.now() - lastReconcileAt >= config.reconcileIntervalMs) {
-          void reconcileTick()
+        let folderState: FolderState
+        try {
+          folderState = await getFolderState(config.apiBaseUrl)
+        } catch (error) {
+          phase = "failed: folder API GET"
+          failure = error instanceof Error ? error.message : String(error)
+          log("reconcile: failed to read folder state; skipping tick", error instanceof Error ? error.message : error)
+          return
+        }
+
+        const misfiled: Array<{ sessionID: string; folderName: string; label: string }> = []
+        for (const session of sessions) {
+          const directory = session.location?.directory
+          if (!session?.id || !directory) { stats.missingMetadata += 1; continue }
+          if (archivedAt(session)) { stats.archivedSkipped += 1; continue }
+          if (pendingFallback.has(session.id)) { stats.inFlight += 1; continue }
+
+          const classification = classifyTitle(session.title ?? "", config.mappings)
+          if (classification.status !== "mapped") { stats.untaggedOrUnmapped += 1; continue }
+
+          const scopedFolders = folderState.foldersMap?.[directory] ?? []
+          const placement = classifyPlacement(scopedFolders, session.id, classification.folderName)
+          if (placement === "already-filed") { stats.alreadyFiled += 1; continue }
+          if (placement === "ambiguous") {
+            stats.ambiguous += 1
+            log("reconcile: folder name ambiguous, skipping", { sessionID: session.id, folderName: classification.folderName })
+            continue
+          }
+          misfiled.push({ sessionID: session.id, folderName: classification.folderName, label: classification.label })
+        }
+
+        const toMove = misfiled.slice(0, RECONCILE_MAX_MOVES_PER_TICK)
+        stats.deferred = misfiled.length - toMove.length
+
+        for (let i = 0; i < toMove.length; i += 1) {
+          if (disposed) {
+            stats.deferred += toMove.length - i
+            break
+          }
+          const item = toMove[i]!
+          try {
+            if (pendingFallback.has(item.sessionID)) { stats.inFlight += 1; continue }
+            const fresh = await ctx.session.get({ sessionID: item.sessionID }) as SessionInfoLike
+            const freshDirectory = fresh.location?.directory
+            if (!fresh?.id || !freshDirectory) { stats.missingMetadata += 1; continue }
+            if (archivedAt(fresh)) { stats.archivedSkipped += 1; continue }
+
+            const freshClassification = classifyTitle(fresh.title ?? "", config.mappings)
+            if (freshClassification.status !== "mapped") { stats.untaggedOrUnmapped += 1; continue }
+
+            const result = await moveSession(config.apiBaseUrl, freshDirectory, fresh.id, freshClassification.folderName)
+            resolvedSessions.add(fresh.id)
+            if (result === "already-filed") stats.alreadyFiled += 1
+            else if (result === "folder-ambiguous") {
+              stats.ambiguous += 1
+              log("reconcile: folder name ambiguous, skipping", { sessionID: fresh.id, folderName: freshClassification.folderName })
+            } else stats.moved += 1
+          } catch (error) {
+            stats.failed += 1
+            firstMoveFailure ??= error instanceof Error ? error.message : String(error)
+            log("reconcile: failed to file session; continuing sweep", { sessionID: item.sessionID, error: error instanceof Error ? error.message : error })
+          }
+        }
+
+        log("reconcile tick complete", { directory: ctx.location.directory, possiblyIncomplete, ...stats })
+      } catch (error) {
+        phase = "failed: session listing or scan"
+        failure = error instanceof Error ? error.message : String(error)
+        log("reconcile tick failed; will retry next interval", error instanceof Error ? error.message : error)
+      } finally {
+        reconciling = false
+        await diagnostic(phase, { possiblyIncomplete, ...stats, ...(failure ? { failure } : {}), ...(firstMoveFailure ? { firstMoveFailure } : {}) })
+      }
+    }
+
+    function scheduleReconcile(delayMs: number) {
+      if (!config.enabled || disposed) return
+      reconcileTimer = setTimeout(() => {
+        void reconcileTick().finally(() => scheduleReconcile(config.reconcileIntervalMs))
+      }, delayMs)
+      reconcileTimer.unref?.()
+    }
+
+    if (config.enabled && reconciliationSupported) scheduleReconcile(RECONCILE_STARTUP_DELAY_MS)
+
+    // Background event loop. V1 received events via a pushed `hooks.event({event})`
+    // callback; V2 delivers them as a pull-based async iterable
+    // (`ctx.event.subscribe({signal})`, confirmed against the real, working
+    // `@openchamber/opencode-claude@1.3.8` plugin on `vm-oc-hugoj2`, which uses the
+    // identical pattern). Aborted from the cleanup function `setup` returns.
+    const eventController = new AbortController()
+    const eventLoop = (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: eventController.signal })) {
+          if (!config.enabled || disposed) continue
+          const type = (event as { type?: string }).type
+          const sessionID = (event as { data?: { sessionID?: string } }).data?.sessionID
+          if (!sessionID) continue
+
+          // `session.created` carries a preset title inline (scheduler/spawn flows,
+          // e.g. `Morning sales brief [Sales]`); `session.renamed` is what the native
+          // title agent fires after `setTitle`. Both go through the same immediate,
+          // no-retry path — V1's primary path, unified across both V2 event types
+          // because neither carries enough fields (notably: no archived flag) to act
+          // on without a fresh `session.get` anyway.
+          if (type === "session.created" || type === "session.renamed") {
+            void attemptFile(sessionID)
+            continue
+          }
+
+          if (type === "session.execution.succeeded" || type === "session.execution.failed" || type === "session.execution.interrupted") {
+            void runFallback(sessionID)
+            if (config.enabled && !disposed && reconciliationSupported && Date.now() - lastReconcileAt >= config.reconcileIntervalMs) {
+              void reconcileTick()
+            }
+          }
+        }
+      } catch (error) {
+        if (!eventController.signal.aborted) {
+          log("event stream ended; chat continues", error instanceof Error ? error.message : error)
         }
       }
-    },
-  }
-}) satisfies Plugin
+    })()
+
+    return async () => {
+      disposed = true
+      eventController.abort()
+      await eventLoop.catch(() => {})
+      if (reconcileTimer) clearTimeout(reconcileTimer)
+      await titleHook.dispose().catch(() => {})
+      if (config.enabled) await diagnostic("disposed")
+    }
+  },
+} satisfies Plugin.Plugin

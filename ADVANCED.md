@@ -22,6 +22,8 @@ These options exist for edge cases and non-default setups. Most users only need 
 
 ## Periodic reconciliation details
 
+**Not active in `0.5.0+` (OpenCode 2).** This whole section describes `0.4.1`'s (OpenCode 1.x) behavior, kept here because the same logic is still present internally in `0.5.0+`, gated behind a runtime check for `session.list` on the plugin context — which the installed `@opencode/plugin@2.0.25` does not provide. It will activate automatically, with everything below applying again unchanged, if a future release restores that method. See the README's Compatibility section.
+
 Unlike the `session.updated`/`session.idle` paths, which only ever act on a session at the moment its title changes, the periodic sweep is tag-authoritative: on every tick it lists every session in the project — including child/subagent sessions, not just top-level ones — and for every one whose title carries a mapped tag, it checks whether the session is currently filed under the matching folder. If not — including a session someone dragged into a different folder by hand, or one whose primary filing event was missed entirely — it moves it. Sessions with no tag, or a tag with no configured mapping, are never touched by the sweep, consistent with the rest of the plugin: filing is one-directional, sessions are never removed from a folder except by being moved to another one.
 
 Notes and limits:
