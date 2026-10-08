@@ -35,7 +35,7 @@ Title updates can occasionally arrive out of order at session start, so the plug
 
 ## Install
 
-Pin an exact version in `opencode.json(c)`'s plugin array — never `@latest` in production, since `0.4.1` (OpenCode 1.x) and `0.5.0+` (OpenCode 2.x) are not interchangeable. Both the V1 tuple form and the V2 object form work (confirmed against a real OpenCode 2.0.25 instance):
+Pin an exact version in `opencode.json(c)`'s plugin array — never `@latest` in production, since `0.4.1` (OpenCode 1.x) and `0.5.0+` (OpenCode 2.x) are not interchangeable. The V1-style tuple form below is confirmed working against a real OpenCode 2.0.25 instance (OpenCode reads and normalizes it even on V2); the V2 object form is per [OpenCode's own plugin docs](https://opencode.ai/v2/docs/build/plugins) but has not independently been confirmed with a local/unpublished build — once this package is live on npm, both forms resolve the same published package, so there is no reason to expect it to behave differently, but it has not been separately tested:
 
 ```jsonc
 // V1-style config key ("plugin", tuple form) — still read and normalized under OpenCode 2
@@ -92,7 +92,7 @@ OpenCode must be restarted after adding, removing, or changing a plugin.
 
 ## Compatibility
 
-- **OpenCode 2.0.20+** with the V2 (`@opencode/plugin`) Promise plugin contract: `session.hook("title", ...)`, `event.subscribe`, and `session.get`. Verified against a real OpenCode 2.0.25 instance (load, title-prompt injection, and event-driven filing all confirmed working end-to-end).
+- **OpenCode 2.0.20+** with the V2 (`@opencode/plugin`) Promise plugin contract: `session.hook("title", ...)`, `event.subscribe`, and `session.get`. Clean-load and the `session.created` event-driven filing path are verified against a real OpenCode 2.0.25 instance end to end (plugin loads, folder gets created, session gets filed). The `session.renamed` path and the `session.execution.*` bounded-retry fallback share the same underlying classify-and-file logic and are covered by the test suite and by `tsc` against the real SDK types, but have not independently been exercised against a live instance. The title-prompt-injection hook (`session.hook("title", ...)`) is covered by a unit test only — exercising it live requires an actual model call, which an isolated test environment can't provide without real provider credentials.
 - OpenChamber with the local `/api/session-folders` endpoint (verified against OpenChamber 2.1.1's rewritten, merge-queue-based route — see [ADVANCED.md](ADVANCED.md) for what changed).
 - Periodic reconciliation additionally needs a `session.list` method on the plugin context, which the installed `@opencode/plugin@2.0.25` does not expose (see above) — it is gated behind a runtime check and currently always off.
 - **For OpenCode 1.x**, use `opencode-session-autofile@0.4.1` instead, which targets the V1 plugin contract and includes active periodic reconciliation.
