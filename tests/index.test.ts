@@ -306,6 +306,54 @@ describe("opencode-session-autofile", () => {
     expect(folders[0].sessionIds).toEqual(["ses_flat"])
   })
 
+  test("idle-triggered reconciliation returns tagged sessions from Client work or root to Sales", async () => {
+    const state = folderApi.getState()
+    state.foldersMap["/proj"] = [
+      { id: "sales", name: "Sales", sessionIds: [], createdAt: 1 },
+      { id: "client-work", name: "Client work", sessionIds: ["ses_wrong"], createdAt: 2 },
+    ]
+    const entries = [
+      session({ id: "ses_wrong", directory: "/proj", title: "Wrong folder [Sales]" }),
+      session({ id: "ses_missing", directory: "/proj", title: "Unassigned [Sales]" }),
+    ]
+    const client = {
+      session: {
+        list: async () => ({ data: entries }),
+        get: async ({ path }: { path: { id: string } }) => ({
+          data: entries.find((entry) => entry.id === path.id) ?? session({ id: path.id, title: "No tag" }),
+        }),
+      },
+    }
+    const hooks = await plugin({ client, directory: "/proj" } as any, {
+      apiBaseUrl: "http://localhost:9999",
+      mappings: { Sales: "Sales" },
+      fallbackMaxAttempts: 1,
+    })
+    try {
+      await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_trigger" } } as any })
+      // Poll the actual converged folder membership, not raw POST count: two
+      // sequential moveSession calls in the same tick can land in the same
+      // millisecond, so the real server's last-write-wins check can legitimately
+      // ignore the second write once (counted in postCallCount) before its bounded
+      // retry (WRITE_RETRY_DELAY_MS later) actually lands it. Waiting for POST
+      // count alone can observe that transient ignored-write moment and assert on
+      // stale state. Disposing only after convergence also avoids leaving that
+      // in-flight retry's timer to resolve during a later test's fetch mock.
+      let sales: { sessionIds?: string[] } | undefined
+      for (let i = 0; i < 100; i += 1) {
+        sales = folderApi.getState().foldersMap["/proj"]?.find((folder: any) => folder.name === "Sales")
+        if (sales?.sessionIds?.includes("ses_wrong") && sales.sessionIds?.includes("ses_missing")) break
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      const folders = folderApi.getState().foldersMap["/proj"]
+      expect(folders.find((folder: any) => folder.name === "Sales")?.sessionIds).toEqual(["ses_wrong", "ses_missing"])
+      expect(folders.find((folder: any) => folder.name === "Client work")?.sessionIds).toEqual([])
+      expect(folderApi.postCallCount()).toBeGreaterThanOrEqual(2)
+    } finally {
+      await hooks.dispose?.()
+    }
+  })
+
   test("mappings: invalid values are ignored and never trigger a folder move", async () => {
     const hooks = await plugin(makeInput(async () => ({ data: undefined })), {
       apiBaseUrl: "http://localhost:9999",

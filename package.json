@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-autofile",
-  "version": "0.3.1",
+  "version": "0.4.1",
   "description": "OpenCode plugin that files sessions into OpenChamber folders from title tags.",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,6 +13,7 @@
   ],
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target bun --format esm",
+    "prepublishOnly": "bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },

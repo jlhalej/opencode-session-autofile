@@ -24,6 +24,10 @@ With a mapping of `{ "Sales": "Client work" }`, a session titled `Follow up with
 
 Title updates can occasionally arrive out of order at session start, so the plugin also does a bounded double-check when a session goes idle: it re-reads the session's current title a few times with a short delay and files it then if the first attempt was missed. This is a safety net, not the primary mechanism — most sessions file immediately.
 
+### Periodic reconciliation
+
+Besides the two event-driven paths above, the plugin also runs a periodic sweep (every 10 minutes by default — see `reconcileIntervalMs` in [ADVANCED.md](ADVANCED.md)) that lists your sessions, re-derives each one's folder from its *current* title tag, and moves any that aren't already filed there — including a session that was moved to a different folder by hand after it was first filed. Untagged or unmapped sessions are always left alone; the plugin only ever files sessions, it never removes one from a folder on its own initiative. Sessions already correctly filed cost no extra API calls, and archived sessions are skipped. See [ADVANCED.md](ADVANCED.md) for the interval option and its limits.
+
 ## Requirements
 
 - **OpenCode**, with plugin hooks and the `session.updated`/`session.idle` events (see [Compatibility](#compatibility)).
@@ -55,7 +59,7 @@ The `mappings` option is a flat JSON object: each key is the tag OpenCode writes
 
 A tag is recognized anywhere in the title, including before a scheduler-added timestamp such as `Morning sales brief [Sales] 2026-08-28 06:00`. A mapping entry that isn't a non-empty string is ignored rather than causing an unexpected move.
 
-For less common options (`enabled`, `titlePrompt`, `fallbackMaxAttempts`, `fallbackDelayMs`), see [ADVANCED.md](ADVANCED.md).
+For less common options (`enabled`, `titlePrompt`, `fallbackMaxAttempts`, `fallbackDelayMs`, `reconcileIntervalMs`), see [ADVANCED.md](ADVANCED.md).
 
 ## Safety and behavior notes
 
@@ -79,3 +83,4 @@ OpenCode must be restarted after adding, removing, or changing a plugin.
 
 - OpenCode with plugin hooks and `session.updated`/`session.idle` events, plus a `PluginInput.client` exposing `session.get`.
 - OpenChamber with the local `/api/session-folders` endpoint.
+- Periodic reconciliation additionally needs `PluginInput.client.session.list`. If it's missing on your OpenCode/SDK build, the plugin logs that once and simply skips the periodic sweep — the two event-driven paths above are unaffected.
