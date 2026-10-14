@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
-import { mkdtemp, writeFile } from "node:fs/promises"
+import { mkdtemp, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { buildTitlePrompt, classify, createRulesSource, normalizeRules, rulesFromMappings } from "../src/rules"
@@ -96,12 +96,13 @@ describe("createRulesSource (rulesFile)", () => {
     const realNow = Date.now
     try {
       Date.now = () => realNow() + 3_000
-      await new Promise((resolve) => setTimeout(resolve, 20))
       await writeFile(file, JSON.stringify([{ folder: "B" }]))
+      await utimes(file, 2_000_000_000, 2_000_000_000)
       expect((await source.get())[0]?.folder).toBe("B")
 
       Date.now = () => realNow() + 6_000
       await writeFile(file, "{ not json")
+      await utimes(file, 2_000_000_100, 2_000_000_100)
       expect((await source.get())[0]?.folder).toBe("B")
       expect(source.problems().length).toBe(1)
     } finally {
