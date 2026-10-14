@@ -1,6 +1,18 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import type { Mock } from "bun:test"
-import plugin from "../src/index.ts"
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+process.env.AUTOFILE_DIAGNOSTIC_DIR = mkdtempSync(join(tmpdir(), "autofile-diag-"))
+// Module-level state (the shared sweep) must not leak between tests, so every test
+// loads its own copy of the module.
+let freshCount = 0
+let plugin: any
+async function loadFreshPlugin() {
+  plugin = (await import(`../src/index.ts?fresh=${freshCount++}`)).default
+}
+await loadFreshPlugin()
 
 type FolderApiMock = {
   fetchMock: typeof fetch
@@ -204,7 +216,8 @@ describe("opencode-session-autofile (V2 / @opencode/plugin promise contract)", (
   let folderApi: FolderApiMock
   let errorSpy: Mock<typeof console.error>
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await loadFreshPlugin()
     folderApi = createFolderApiMock()
     globalThis.fetch = folderApi.fetchMock
     errorSpy = spyOn(console, "error").mockImplementation(() => {})
@@ -487,6 +500,7 @@ describe("opencode-session-autofile (V2 / @opencode/plugin promise contract)", (
   describe("periodic sweep over OpenChamber's GET /api/session", () => {
     // The first turn-end event triggers the sweep (lastSweepAt starts at 0).
     async function runSweep(options: Record<string, unknown>, sessions: Array<Record<string, unknown>>, pageSize?: number) {
+      await loadFreshPlugin()
       folderApi = createFolderApiMock({ sessions, pageSize })
       globalThis.fetch = folderApi.fetchMock
       const { ctx, push } = makeCtx({

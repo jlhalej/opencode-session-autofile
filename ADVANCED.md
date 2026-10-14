@@ -4,7 +4,7 @@
 | --- | --- | --- |
 | `enabled` | `true` | Kill switch for filing and the sweep. The title-tagging prompt still loads. |
 | `apiBaseUrl` | `http://localhost:3000` | OpenChamber web server. Used for the folder API and for listing sessions. |
-| `dryRun` | `false` | Log and record what would move; never write. The sweep's plan lands in `/tmp/opencode-session-autofile/sweep.json` under `wouldMove`. |
+| `dryRun` | `false` | Log and record what would move; never write. The sweep's plan lands in `/tmp/opencode-session-autofile/sweep-<pid>.json` under `wouldMove`.|
 | `includeSubagents` | `false` | Also file child/subagent sessions (those with a parent). |
 | `titlePrompt` | generated from the rules | Full replacement for the title prompt. If you set it, it must still end titles with a tag your rules know. |
 | `fallbackMaxAttempts` | `3` | Re-checks of a session's title after a turn ends. `1`-`10`. |
@@ -17,4 +17,4 @@
 - Sessions are filed under their own `location.directory`, the key OpenChamber uses for folders.
 - At most 100 sessions are moved per pass, in one batched write; the rest wait for the next pass. Each candidate is re-read right before writing, so a title changed in the meantime is not overwritten with a stale decision.
 - One sweep runs per OpenCode process, however many directories load the plugin. Two OpenCode processes against the same OpenChamber each run their own; moves are idempotent, so this is wasteful at worst.
-- Status for operators: `/tmp/opencode-session-autofile/<hash>.json` per directory (loaded rules, problems) and `sweep.json` (last pass counts).
+- Status for operators: `/tmp/opencode-session-autofile/<pid>-<hash>.json` per directory (loaded rules, problems) and `sweep-<pid>.json` (last pass counts); set `AUTOFILE_DIAGNOSTIC_DIR` to move them.

@@ -42,7 +42,7 @@ Put the rules in a file and point the plugin at it. The file is re-read whenever
 
 `rules` can also be given inline instead of `rulesFile`. The old `mappings` table (`{ "Tag": "Folder" }`) still works when no `rules` are set. With no configuration at all, a built-in list of domains (Language, Tech, Personal, Business, Sales, Career, Finance, Immigration, Artist) applies.
 
-Try a rules file against your live sessions before turning it on, writing nothing:
+Try a rules file against your live sessions before turning it on, writing nothing (from a clone of this repo; the script is not part of the npm package):
 
 ```bash
 bun scripts/dry-run.ts path/to/rules.json http://localhost:3000

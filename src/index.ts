@@ -74,7 +74,8 @@ const SWEEP_PAGE_LIMIT = 200
 const SWEEP_SCAN_CAP = 5_000
 const SWEEP_MAX_PAGES = 50
 
-const DIAGNOSTIC_DIR = "/tmp/opencode-session-autofile"
+// Overridable so tests never write into a real host's diagnostics.
+const DIAGNOSTIC_DIR = process.env.AUTOFILE_DIAGNOSTIC_DIR || "/tmp/opencode-session-autofile"
 
 function log(message: string, detail?: unknown) {
   console.error("[session-autofile]", message, detail ?? "")
@@ -259,8 +260,15 @@ type SweepInstance = {
   source: RulesSource
 }
 
+// OpenCode creates one plugin instance per location (directory) and disposes idle ones
+// (about an hour in practice), so instance lifetime is not process lifetime. The sweep
+// therefore belongs to the module, not to any instance: it keeps running on the last
+// known configuration after every instance is gone, and each newly loaded instance
+// replaces that configuration and asks for a catch-up pass. A session created while no
+// instance for its directory was loaded is picked up by that pass.
 const shared = {
   instances: new Map<symbol, SweepInstance>(),
+  lastKnown: undefined as SweepInstance | undefined,
   timer: undefined as ReturnType<typeof setTimeout> | undefined,
   sweeping: false,
   lastSweepAt: 0,
@@ -310,7 +318,7 @@ async function fetchSession(apiBaseUrl: string, sessionID: string): Promise<Sess
 async function writeSweepDiagnostic(detail: Record<string, unknown>) {
   try {
     await mkdir(DIAGNOSTIC_DIR, { recursive: true })
-    await writeFile(`${DIAGNOSTIC_DIR}/sweep.json`, JSON.stringify({ pid: process.pid, recordedAt: new Date().toISOString(), ...detail }, null, 2), { mode: 0o600 })
+    await writeFile(`${DIAGNOSTIC_DIR}/sweep-${process.pid}.json`, JSON.stringify({ pid: process.pid, recordedAt: new Date().toISOString(), ...detail }, null, 2), { mode: 0o600 })
   } catch (error) {
     log("sweep: could not record diagnostic", error instanceof Error ? error.message : error)
   }
@@ -319,7 +327,7 @@ async function writeSweepDiagnostic(detail: Record<string, unknown>) {
 function currentSweepInstance(): SweepInstance | undefined {
   let latest: SweepInstance | undefined
   for (const instance of shared.instances.values()) latest = instance
-  return latest
+  return latest ?? shared.lastKnown
 }
 
 async function sweepTick(): Promise<void> {
@@ -403,8 +411,18 @@ async function sweepTick(): Promise<void> {
   }
 }
 
+// A new instance asks for a pass soon, unless one just ran or one is about to.
+function requestSweepSoon() {
+  if (Date.now() - shared.lastSweepAt < 60_000) return
+  if (shared.timer) {
+    clearTimeout(shared.timer)
+    shared.timer = undefined
+  }
+  scheduleSweep(SWEEP_STARTUP_DELAY_MS)
+}
+
 function scheduleSweep(delayMs: number) {
-  if (shared.timer || shared.instances.size === 0) return
+  if (shared.timer || !currentSweepInstance()) return
   shared.timer = setTimeout(() => {
     shared.timer = undefined
     void sweepTick().finally(() => scheduleSweep(currentSweepInstance()?.config.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS))
@@ -424,7 +442,7 @@ export default {
     // managed OpenCode process is alive. Keep a small, non-secret status snapshot
     // outside the synced vault so an operator can tell what this instance loaded.
     const diagnosticPath = typeof ctx.location.directory === "string"
-      ? `${DIAGNOSTIC_DIR}/${createHash("sha256").update(ctx.location.directory).digest("hex").slice(0, 16)}.json`
+      ? `${DIAGNOSTIC_DIR}/${process.pid}-${createHash("sha256").update(ctx.location.directory).digest("hex").slice(0, 12)}.json`
       : null
     const startedAt = new Date().toISOString()
     async function diagnostic(phase: string, detail: Record<string, unknown> = {}) {
@@ -530,8 +548,10 @@ export default {
 
     let disposed = false
     if (config.enabled) {
-      shared.instances.set(instanceKey, { config, source })
-      scheduleSweep(SWEEP_STARTUP_DELAY_MS)
+      const registered = { config, source }
+      shared.instances.set(instanceKey, registered)
+      shared.lastKnown = registered
+      requestSweepSoon()
       void diagnostic("initialized")
     }
 
@@ -567,13 +587,8 @@ export default {
       disposed = true
       eventController.abort()
       await eventLoop.catch(() => {})
+      // The sweep outlives its instances on purpose (see `shared`).
       shared.instances.delete(instanceKey)
-      if (shared.instances.size === 0) {
-        // Last instance gone: the next load starts a fresh sweep schedule.
-        if (shared.timer) clearTimeout(shared.timer)
-        shared.timer = undefined
-        shared.lastSweepAt = 0
-      }
       await titleHook.dispose().catch(() => {})
       if (config.enabled) await diagnostic("disposed")
     }

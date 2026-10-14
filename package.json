@@ -8,7 +8,6 @@
   "files": [
     "dist",
     "examples",
-    "scripts",
     "README.md",
     "ADVANCED.md",
     "LICENSE"
