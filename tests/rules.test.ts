@@ -81,6 +81,20 @@ describe("buildTitlePrompt", () => {
   })
 })
 
+describe("createRulesSource (optional default file)", () => {
+  test("a missing optional file is silent and keeps the inline rules", async () => {
+    const source = createRulesSource({ rulesFile: "/nonexistent/dir/rules.json", optional: true, inline: rules, log: () => {} })
+    expect(await source.get()).toBe(rules)
+    expect(source.problems()).toEqual([])
+  })
+
+  test("a missing required file is reported", async () => {
+    const source = createRulesSource({ rulesFile: "/nonexistent/dir/rules.json", inline: rules, log: () => {} })
+    await source.get()
+    expect(source.problems().length).toBe(1)
+  })
+})
+
 describe("createRulesSource (rulesFile)", () => {
   const errorSpy = spyOn(console, "error").mockImplementation(() => {})
   afterEach(() => errorSpy.mockClear())

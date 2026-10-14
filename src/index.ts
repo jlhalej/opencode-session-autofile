@@ -6,6 +6,7 @@ import {
   buildTitlePrompt,
   classify,
   createRulesSource,
+  defaultRulesPath,
   normalizeRules,
   rulesFromMappings,
   type Rule,
@@ -41,7 +42,8 @@ export type SessionAutofileOptions = {
   titlePrompt?: string
   // Log and record what would move, but never write to OpenChamber.
   dryRun?: boolean
-  // Child/subagent sessions are left alone unless this is true.
+  // Child/subagent sessions are filed wherever their root session goes. Set to false
+  // to leave them alone.
   includeSubagents?: boolean
   fallbackMaxAttempts?: number
   fallbackDelayMs?: number
@@ -85,6 +87,7 @@ type ResolvedOptions = {
   enabled: boolean
   apiBaseUrl: string
   rulesFile?: string
+  rulesFileOptional: boolean
   inlineRules: Rule[]
   titlePrompt?: string
   dryRun: boolean
@@ -111,17 +114,20 @@ function resolveOptions(options: Record<string, unknown>): ResolvedOptions {
   }
   const rulesFile = typeof options.rulesFile === "string" && options.rulesFile.trim() ? options.rulesFile.trim() : undefined
   // With a rules file, defaults would only be a surprise: inline stays empty until the
-  // file loads. Without any configuration at all, the built-in domain list applies.
-  if (inlineRules.length === 0 && !rulesFile && options.rules === undefined && options.mappings === undefined) inlineRules = DEFAULT_RULES
+  // file loads. With no configuration at all, the conventional rules file is watched
+  // (optional, may not exist) and the built-in domain list applies until it does.
+  const unconfigured = !rulesFile && options.rules === undefined && options.mappings === undefined
+  if (inlineRules.length === 0 && unconfigured) inlineRules = DEFAULT_RULES
 
   return {
     enabled: options.enabled !== false,
     apiBaseUrl: typeof options.apiBaseUrl === "string" && options.apiBaseUrl.trim() ? options.apiBaseUrl : "http://localhost:3000",
-    rulesFile,
+    rulesFile: rulesFile ?? (unconfigured ? defaultRulesPath() : undefined),
+    rulesFileOptional: unconfigured,
     inlineRules,
     titlePrompt: typeof options.titlePrompt === "string" && options.titlePrompt.trim() ? options.titlePrompt.trim() : undefined,
     dryRun: options.dryRun === true,
-    includeSubagents: options.includeSubagents === true,
+    includeSubagents: options.includeSubagents !== false,
     fallbackMaxAttempts: typeof fallbackMaxAttempts === "number" && Number.isInteger(fallbackMaxAttempts) && fallbackMaxAttempts >= 1 && fallbackMaxAttempts <= 10 ? fallbackMaxAttempts : DEFAULT_FALLBACK_MAX_ATTEMPTS,
     fallbackDelayMs: typeof fallbackDelayMs === "number" && Number.isFinite(fallbackDelayMs) && fallbackDelayMs >= 0 && fallbackDelayMs <= 5_000 ? fallbackDelayMs : DEFAULT_FALLBACK_DELAY_MS,
     sweepIntervalMs: typeof sweepIntervalMs === "number" && Number.isFinite(sweepIntervalMs) && sweepIntervalMs >= MIN_SWEEP_INTERVAL_MS && sweepIntervalMs <= MAX_SWEEP_INTERVAL_MS ? sweepIntervalMs : DEFAULT_SWEEP_INTERVAL_MS,
@@ -248,6 +254,23 @@ function archivedAt(session: SessionInfoLike): number {
   return typeof session.time?.archived === "number" ? session.time.archived : 0
 }
 
+// A subagent session is filed wherever its root (top-level) session goes, so its own
+// title and directory are never classified. `getParent` returns null when the parent
+// cannot be read, in which case the child is left alone rather than guessed at.
+const MAX_PARENT_DEPTH = 10
+async function resolveRoot(session: SessionInfoLike, getParent: (id: string) => Promise<SessionInfoLike | null>): Promise<SessionInfoLike | null> {
+  let current = session
+  const seen = new Set<string>([session.id])
+  for (let depth = 0; current.parentID; depth += 1) {
+    if (depth >= MAX_PARENT_DEPTH || seen.has(current.parentID)) return null
+    const parent = await getParent(current.parentID)
+    if (!parent?.id) return null
+    seen.add(parent.id)
+    current = parent
+  }
+  return current
+}
+
 // ---------------------------------------------------------------------------------
 // Periodic sweep. It reads sessions from OpenChamber's own `GET /api/session` (global,
 // cursor-paginated), not from the plugin context: the V2 plugin context has no
@@ -337,7 +360,7 @@ async function sweepTick(): Promise<void> {
   shared.sweeping = true
   shared.lastSweepAt = Date.now()
   const { config, source } = instance
-  const stats = { listed: 0, archivedSkipped: 0, subagentsSkipped: 0, inFlight: 0, noRule: 0, alreadyFiled: 0, moved: 0, deferred: 0, ambiguous: 0, staleSkipped: 0 }
+  const stats = { listed: 0, archivedSkipped: 0, subagentsSkipped: 0, rootUnavailable: 0, inFlight: 0, noRule: 0, alreadyFiled: 0, moved: 0, deferred: 0, ambiguous: 0, staleSkipped: 0 }
   let phase = "completed"
   let failure: string | undefined
   let truncated = false
@@ -349,6 +372,8 @@ async function sweepTick(): Promise<void> {
     stats.listed = listing.sessions.length
     if (truncated) log("sweep: session count exceeds the scan cap; this pass is NOT complete", { cap: SWEEP_SCAN_CAP })
 
+    const listed = new Map(listing.sessions.map((entry) => [entry.id, entry]))
+    const getParent = async (id: string) => listed.get(id) ?? await fetchSession(config.apiBaseUrl, id).catch(() => null)
     const folderState = await getFolderState(config.apiBaseUrl)
     const candidates: typeof plan = []
     for (const session of listing.sessions) {
@@ -357,7 +382,9 @@ async function sweepTick(): Promise<void> {
       if (archivedAt(session)) { stats.archivedSkipped += 1; continue }
       if (session.parentID && !config.includeSubagents) { stats.subagentsSkipped += 1; continue }
       if (inFlight.has(session.id)) { stats.inFlight += 1; continue }
-      const match = classify(session.title ?? "", directory, rules)
+      const root = await resolveRoot(session, getParent)
+      if (!root || archivedAt(root)) { stats.rootUnavailable += 1; continue }
+      const match = classify(root.title ?? "", root.location?.directory ?? directory, rules)
       if (match.status !== "match") { stats.noRule += 1; continue }
       const placement = classifyPlacement(folderState.foldersMap?.[directory] ?? [], session.id, match.folder)
       if (placement === "already-filed") { stats.alreadyFiled += 1; continue }
@@ -381,8 +408,9 @@ async function sweepTick(): Promise<void> {
     for (const candidate of batch) {
       if (inFlight.has(candidate.sessionID)) { stats.inFlight += 1; continue }
       const fresh = await fetchSession(config.apiBaseUrl, candidate.sessionID).catch(() => null)
-      const freshMatch = fresh ? classify(fresh.title ?? "", candidate.scope, rules) : null
-      if (!fresh || archivedAt(fresh) || freshMatch?.status !== "match" || freshMatch.folder !== candidate.folder) { stats.staleSkipped += 1; continue }
+      const freshRoot = fresh ? await resolveRoot(fresh, (id) => fetchSession(config.apiBaseUrl, id).catch(() => null)) : null
+      const freshMatch = freshRoot ? classify(freshRoot.title ?? "", freshRoot.location?.directory ?? candidate.scope, rules) : null
+      if (!fresh || archivedAt(fresh) || !freshRoot || archivedAt(freshRoot) || freshMatch?.status !== "match" || freshMatch.folder !== candidate.folder) { stats.staleSkipped += 1; continue }
       items.push({ scope: candidate.scope, sessionID: candidate.sessionID, folderName: candidate.folder })
     }
     if (items.length > 0) {
@@ -435,7 +463,7 @@ export default {
   async setup(ctx) {
     const config = resolveOptions(ctx.options)
     const instanceKey = Symbol("autofile-instance")
-    const source = createRulesSource({ rulesFile: config.rulesFile, inline: config.inlineRules, log })
+    const source = createRulesSource({ rulesFile: config.rulesFile, optional: config.rulesFileOptional, inline: config.inlineRules, log })
     await source.get()
 
     // OpenChamber captures plugin stderr in an inaccessible in-memory buffer while its
@@ -490,7 +518,10 @@ export default {
       }
       if (info.parentID && !config.includeSubagents) return "skipped"
       const directory = info.location?.directory
-      const match = classify(info.title ?? "", directory, await source.get())
+      const root = await resolveRoot(info, async (id) => await ctx.session.get({ sessionID: id }).catch(() => null) as SessionInfoLike | null)
+      if (!root) return "none"
+      if (archivedAt(root)) return "archived"
+      const match = classify(root.title ?? "", root.location?.directory ?? directory, await source.get())
       if (match.status === "unfiled") return "unfiled"
       if (match.status === "none") return "none"
       if (!directory) return "none"

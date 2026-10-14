@@ -497,6 +497,22 @@ describe("opencode-session-autofile (V2 / @opencode/plugin promise contract)", (
     await cleanup?.()
   })
 
+  test("event path: a subagent session is filed with its root session", async () => {
+    const byId: Record<string, any> = {
+      ses_root: session({ id: "ses_root", title: "Quarterly review [Sales]" }),
+      ses_sub: session({ id: "ses_sub", title: "Subtask", parentID: "ses_root" }),
+    }
+    const { ctx, push } = makeCtx({
+      options: { apiBaseUrl: "http://localhost:9999", fallbackMaxAttempts: 1, reconcileIntervalMs: 86_400_000 },
+      sessionGet: async ({ sessionID }: any) => byId[sessionID],
+    })
+    const cleanup = await plugin.setup(ctx)
+    push({ type: "session.created", data: { sessionID: "ses_sub" } })
+    await waitUntil(() => folderApi.postCallCount() >= 1)
+    expect(folderApi.getState().foldersMap["/proj"].find((folder: any) => folder.name === "Sales").sessionIds).toEqual(["ses_sub"])
+    await cleanup?.()
+  })
+
   describe("periodic sweep over OpenChamber's GET /api/session", () => {
     // The first turn-end event triggers the sweep (lastSweepAt starts at 0).
     async function runSweep(options: Record<string, unknown>, sessions: Array<Record<string, unknown>>, pageSize?: number) {
@@ -569,25 +585,63 @@ describe("opencode-session-autofile (V2 / @opencode/plugin promise contract)", (
       }
     })
 
-    test("archived sessions and subagents are skipped unless includeSubagents is set", async () => {
-      const sessions = [
+    test("archived sessions are skipped", async () => {
+      const cleanup = await runSweep({}, [
         session({ id: "ses_old", title: "Old [Tech]", archived: 1 }),
-        session({ id: "ses_child", title: "Child [Tech]", parentID: "ses_parent" }),
         session({ id: "ses_ok", title: "Live [Tech]" }),
-      ]
-      const cleanup = await runSweep({}, sessions)
+      ])
       try {
         await waitUntil(() => folderApi.postCallCount() >= 1)
         expect(folderApi.getState().foldersMap["/proj"].find((folder: any) => folder.name === "Tech").sessionIds).toEqual(["ses_ok"])
       } finally {
         await cleanup()
       }
-      const withChildren = await runSweep({ includeSubagents: true }, sessions)
+    })
+
+    test("a subagent session follows its root session, ignoring its own title", async () => {
+      const cleanup = await runSweep({}, [
+        session({ id: "ses_root", title: "Pipeline notes [Sales]" }),
+        session({ id: "ses_child", title: "Explore the repo [Tech]", parentID: "ses_root" }),
+        session({ id: "ses_grandchild", title: "Untitled", parentID: "ses_child" }),
+      ])
       try {
         await waitUntil(() => folderApi.postCallCount() >= 1)
-        expect(folderApi.getState().foldersMap["/proj"].find((folder: any) => folder.name === "Tech").sessionIds).toEqual(["ses_child", "ses_ok"])
+        const folders = folderApi.getState().foldersMap["/proj"]
+        expect(folders.find((folder: any) => folder.name === "Sales").sessionIds).toEqual(["ses_root", "ses_child", "ses_grandchild"])
+        expect(folders.find((folder: any) => folder.name === "Tech")).toBeUndefined()
       } finally {
-        await withChildren()
+        await cleanup()
+      }
+    })
+
+    test("a subagent whose parent is not in the listing is looked up; an unreadable parent leaves it alone", async () => {
+      // `ses_far` exists on the server but is not in the first listing pages we serve.
+      const sessions = [
+        session({ id: "ses_kid", title: "Kid", parentID: "ses_far" }),
+        session({ id: "ses_orphan", title: "Orphan [Tech]", parentID: "ses_missing" }),
+        session({ id: "ses_far", title: "Far away [Sales]" }),
+      ]
+      const cleanup = await runSweep({}, sessions, 2)
+      try {
+        await waitUntil(() => folderApi.postCallCount() >= 1)
+        const folders = folderApi.getState().foldersMap["/proj"]
+        expect(folders.find((folder: any) => folder.name === "Sales").sessionIds).toEqual(["ses_kid", "ses_far"])
+        expect(folders.find((folder: any) => folder.name === "Tech")).toBeUndefined()
+      } finally {
+        await cleanup()
+      }
+    })
+
+    test("includeSubagents: false leaves subagents alone", async () => {
+      const cleanup = await runSweep({ includeSubagents: false }, [
+        session({ id: "ses_root", title: "Root [Sales]" }),
+        session({ id: "ses_child", title: "Child", parentID: "ses_root" }),
+      ])
+      try {
+        await waitUntil(() => folderApi.postCallCount() >= 1)
+        expect(folderApi.getState().foldersMap["/proj"].find((folder: any) => folder.name === "Sales").sessionIds).toEqual(["ses_root"])
+      } finally {
+        await cleanup()
       }
     })
 

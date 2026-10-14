@@ -5,7 +5,7 @@
 | `enabled` | `true` | Kill switch for filing and the sweep. The title-tagging prompt still loads. |
 | `apiBaseUrl` | `http://localhost:3000` | OpenChamber web server. Used for the folder API and for listing sessions. |
 | `dryRun` | `false` | Log and record what would move; never write. The sweep's plan lands in `/tmp/opencode-session-autofile/sweep-<pid>.json` under `wouldMove`.|
-| `includeSubagents` | `false` | Also file child/subagent sessions (those with a parent). |
+| `includeSubagents` | `true` | Subagent sessions are filed with their root session. `false` leaves them alone. |
 | `titlePrompt` | generated from the rules | Full replacement for the title prompt. If you set it, it must still end titles with a tag your rules know. |
 | `fallbackMaxAttempts` | `3` | Re-checks of a session's title after a turn ends. `1`-`10`. |
 | `fallbackDelayMs` | `500` | Delay between those re-checks. `0`-`5000`. |

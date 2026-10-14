@@ -31,7 +31,7 @@ The tag list the title model is offered is generated from these same rules, so w
 
 ## Setup
 
-Put the rules in a file and point the plugin at it. The file is re-read whenever it changes, so edits apply without restarting OpenCode (a broken edit keeps the last good rules and is reported in the diagnostics).
+Put the rules in a file. With no options at all the plugin looks for `~/.config/opencode/session-autofile-rules.json` (it does not need to exist; until it does, the built-in domain list applies). To keep the file somewhere else, point the plugin at it with `rulesFile`. The file is re-read whenever it changes, so edits apply without restarting OpenCode (a broken edit keeps the last good rules and is reported in the diagnostics).
 
 ```jsonc
 // opencode.jsonc
@@ -53,7 +53,7 @@ or set `"dryRun": true` in the plugin options to make the plugin itself only log
 ## When it runs
 
 1. **When a session is created or renamed**, and **when a turn ends** (a few bounded re-checks, for titles that arrive late). A session already in the right folder costs one read and no write.
-2. **A periodic sweep** (every 10 minutes by default, first pass ~20 s after load) lists every session from OpenChamber's `GET /api/session` and fixes the ones that are in the wrong folder, including one dragged away by hand: the rules always win. Archived sessions are skipped, and so are subagent sessions unless `includeSubagents` is `true`. It needs OpenChamber's API reachable at `apiBaseUrl` (default `http://localhost:3000`); if you set a UI password the plugin cannot authenticate and will fail silently.
+2. **A periodic sweep** (every 10 minutes by default, first pass ~20 s after load) lists every session from OpenChamber's `GET /api/session` and fixes the ones that are in the wrong folder, including one dragged away by hand: the rules always win. Archived sessions are skipped. A subagent session goes wherever its root session goes (its own title is ignored); set `includeSubagents` to `false` to leave subagents alone. It needs OpenChamber's API reachable at `apiBaseUrl` (default `http://localhost:3000`); if you set a UI password the plugin cannot authenticate and will fail silently.
 
 Filing failures are logged and never block the chat.
 

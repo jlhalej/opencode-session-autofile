@@ -176,6 +176,12 @@ export function buildTitlePrompt(rules: Rule[]): string {
   return `${PROMPT_INTRO}\n${lines.join("\n")}\n${PROMPT_OUTRO}`
 }
 
+// Where rules are looked for when neither `rules`, `rulesFile` nor `mappings` is set.
+export function defaultRulesPath(): string {
+  const base = process.env.XDG_CONFIG_HOME || `${homedir()}/.config`
+  return `${base}/opencode/session-autofile-rules.json`
+}
+
 export function expandHome(path: string): string {
   return path === "~" || path.startsWith("~/") ? `${homedir()}${path.slice(1)}` : path
 }
@@ -188,7 +194,8 @@ export type RulesSource = {
 
 // `rules` file shape: either `[...]` or `{ "rules": [...] }`. A file that stops
 // parsing keeps the last good rules in force instead of silently emptying them.
-export function createRulesSource(options: { rulesFile?: string; inline: Rule[]; log: (message: string, detail?: unknown) => void }): RulesSource {
+// `optional`: a missing file is normal (the conventional default location), not a problem.
+export function createRulesSource(options: { rulesFile?: string; optional?: boolean; inline: Rule[]; log: (message: string, detail?: unknown) => void }): RulesSource {
   const path = options.rulesFile ? expandHome(options.rulesFile) : undefined
   let current = options.inline
   let mtimeMs = -1
@@ -213,6 +220,7 @@ export function createRulesSource(options: { rulesFile?: string; inline: Rule[];
         mtimeMs = info.mtimeMs
         options.log("rules file loaded", { path, rules: current.length, problems: problems.length })
       } catch (error) {
+        if (options.optional && (error as NodeJS.ErrnoException)?.code === "ENOENT") return current
         const message = error instanceof Error ? error.message : String(error)
         problems = [`rules file ${path}: ${message}`]
         mtimeMs = -1

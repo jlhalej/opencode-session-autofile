@@ -1,14 +1,14 @@
 // Preview what a rules file would do against a live OpenChamber, without writing anything.
-//   bun scripts/dry-run.ts <rulesFile> [apiBaseUrl] [--include-subagents]
+//   bun scripts/dry-run.ts <rulesFile> [apiBaseUrl] [--no-subagents]
 import { readFile } from "node:fs/promises"
 import { classify, expandHome, normalizeRules } from "../src/rules"
 
 const args = process.argv.slice(2).filter((arg) => !arg.startsWith("--"))
-const includeSubagents = process.argv.includes("--include-subagents")
+const includeSubagents = !process.argv.includes("--no-subagents")
 const rulesFile = args[0]
 const base = args[1] ?? "http://localhost:3000"
 if (!rulesFile) {
-  console.error("usage: bun scripts/dry-run.ts <rulesFile> [apiBaseUrl] [--include-subagents]")
+  console.error("usage: bun scripts/dry-run.ts <rulesFile> [apiBaseUrl] [--no-subagents]")
   process.exit(2)
 }
 
@@ -35,6 +35,14 @@ const folderState = await (await fetch(new URL("/api/session-folders", base))).j
 const currentFolder = (dir: string, id: string) =>
   (folderState.foldersMap?.[dir] ?? []).find((folder: any) => folder.sessionIds?.includes(id))?.name ?? "(none)"
 
+const byId = new Map<string, any>(sessions.map((session) => [session.id, session]))
+// A subagent is filed wherever its root session goes.
+const rootOf = (session: any) => {
+  let current = session
+  for (let depth = 0; current?.parentID && depth < 10; depth += 1) current = byId.get(current.parentID)
+  return current?.parentID ? undefined : current
+}
+
 const counts: Record<string, number> = {}
 let active = 0
 for (const session of sessions) {
@@ -42,7 +50,8 @@ for (const session of sessions) {
   if (session.parentID && !includeSubagents) continue
   active += 1
   const dir = session.location?.directory
-  const match = classify(session.title ?? "", dir, rules)
+  const root = rootOf(session)
+  const match = root ? classify(root.title ?? "", root.location?.directory ?? dir, rules) : { status: "none" as const }
   const from = dir ? currentFolder(dir, session.id) : "(no dir)"
   const to = match.status === "match" ? match.folder : match.status === "unfiled" ? "[Unfiled]" : "(no rule)"
   const via = match.status === "match" ? `${match.via}:${match.detail}` : ""
