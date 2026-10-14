@@ -6,10 +6,14 @@ type FolderApiMock = {
   fetchMock: typeof fetch
   getCallCount: () => number
   postCallCount: () => number
+  listCallCount: () => number
   getState: () => any
 }
 
 type FolderApiMockOptions = {
+  // Sessions served by GET /api/session (pages of `pageSize`) and GET /api/session/:id.
+  sessions?: Array<Record<string, unknown>>
+  pageSize?: number
   forceIgnoredWrites?: number
   onFirstForcedIgnore?: (state: any) => void
 }
@@ -18,12 +22,28 @@ function createFolderApiMock(options: FolderApiMockOptions = {}): FolderApiMock 
   let state: any = { version: 1, rev: 0, foldersMap: {}, collapsedFolderIds: [], updatedAt: 0 }
   let getCalls = 0
   let postCalls = 0
+  let listCalls = 0
   let ignoredRemaining = options.forceIgnoredWrites ?? 0
   let firstForcedIgnoreFired = false
 
   const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString()
     const parsed = new URL(url)
+    if (parsed.pathname === "/api/session") {
+      listCalls += 1
+      const all = options.sessions ?? []
+      const size = options.pageSize ?? 200
+      const offset = Number(parsed.searchParams.get("cursor") ?? 0)
+      const data = all.slice(offset, offset + size)
+      // Like the real endpoint: even the last page carries a `next` cursor, and the page
+      // after it is empty.
+      return new Response(JSON.stringify({ data, cursor: { next: String(offset + size) } }), { status: 200 })
+    }
+    if (parsed.pathname.startsWith("/api/session/")) {
+      const id = decodeURIComponent(parsed.pathname.slice("/api/session/".length))
+      const found = (options.sessions ?? []).find((entry) => entry.id === id)
+      return found ? new Response(JSON.stringify({ data: found }), { status: 200 }) : new Response("{}", { status: 404 })
+    }
     if (parsed.pathname !== "/api/session-folders") throw new Error(`Unexpected fetch URL: ${url}`)
 
     const method = init?.method ?? "GET"
@@ -63,6 +83,7 @@ function createFolderApiMock(options: FolderApiMockOptions = {}): FolderApiMock 
     fetchMock,
     getCallCount: () => getCalls,
     postCallCount: () => postCalls,
+    listCallCount: () => listCalls,
     getState: () => state,
   }
 }
@@ -133,11 +154,12 @@ function makeSessionGetQueue(responses: Array<Record<string, unknown>>) {
   return { fn, callCount: () => calls }
 }
 
-function session(overrides: Partial<{ id: string; directory: string; title: string; archived: number }>) {
-  const { id = "ses_default", directory = "/proj", title = "Untitled", archived } = overrides
+function session(overrides: Partial<{ id: string; directory: string; title: string; archived: number; parentID: string }>) {
+  const { id = "ses_default", directory = "/proj", title = "Untitled", archived, parentID } = overrides
   return {
     id,
     title,
+    ...(parentID ? { parentID } : {}),
     location: { directory },
     time: archived ? { archived } : {},
   }
@@ -281,8 +303,8 @@ describe("opencode-session-autofile (V2 / @opencode/plugin promise contract)", (
     await waitUntil(() => sessionGet.callCount() >= 3)
     await new Promise((resolve) => setTimeout(resolve, 20))
 
+    // The turn-end event also kicks off a sweep, which only reads; nothing is written.
     expect(folderApi.postCallCount()).toBe(0)
-    expect(folderApi.getCallCount()).toBe(0)
     await cleanup?.()
   })
 
@@ -316,10 +338,10 @@ describe("opencode-session-autofile (V2 / @opencode/plugin promise contract)", (
     await cleanup?.()
   })
 
-  test("idempotency: fallback skips a session already resolved by the primary path", async () => {
+  test("no memory: a later turn re-checks the session but never rewrites one that is already filed", async () => {
     const sessionGet = makeSessionGetQueue([session({ id: "ses_6", directory: "/proj", title: "Fix the bug [Tech]" })])
     const { ctx, push } = makeCtx({
-      options: { apiBaseUrl: "http://localhost:9999", fallbackMaxAttempts: 3, fallbackDelayMs: 5 },
+      options: { apiBaseUrl: "http://localhost:9999", fallbackMaxAttempts: 3, fallbackDelayMs: 5, reconcileIntervalMs: 86_400_000 },
       sessionGet: sessionGet.fn,
     })
     const cleanup = await plugin.setup(ctx)
@@ -327,10 +349,34 @@ describe("opencode-session-autofile (V2 / @opencode/plugin promise contract)", (
     push({ type: "session.renamed", data: { sessionID: "ses_6", title: "Fix the bug [Tech]" } })
     await waitUntil(() => folderApi.postCallCount() >= 1)
     push({ type: "session.execution.succeeded", data: { sessionID: "ses_6" } })
+    await waitUntil(() => sessionGet.callCount() >= 2)
     await new Promise((resolve) => setTimeout(resolve, 30))
 
-    expect(sessionGet.callCount()).toBe(1)
     expect(folderApi.postCallCount()).toBe(1)
+    await cleanup?.()
+  })
+
+  test("no memory: a session dragged out of its folder is put back on its next turn", async () => {
+    const sessionGet = makeSessionGetQueue([session({ id: "ses_8", directory: "/proj", title: "Fix the bug [Tech]" })])
+    const { ctx, push } = makeCtx({
+      options: { apiBaseUrl: "http://localhost:9999", fallbackMaxAttempts: 1, reconcileIntervalMs: 86_400_000 },
+      sessionGet: sessionGet.fn,
+    })
+    const cleanup = await plugin.setup(ctx)
+
+    push({ type: "session.renamed", data: { sessionID: "ses_8", title: "Fix the bug [Tech]" } })
+    await waitUntil(() => folderApi.postCallCount() >= 1)
+    const state = folderApi.getState()
+    const tech = state.foldersMap["/proj"].find((folder: any) => folder.name === "Tech")
+    tech.sessionIds = []
+    state.foldersMap["/proj"].push({ id: "other", name: "Other", sessionIds: ["ses_8"], createdAt: 5 })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+
+    push({ type: "session.execution.succeeded", data: { sessionID: "ses_8" } })
+    await waitUntil(() => folderApi.postCallCount() >= 2)
+    const folders = folderApi.getState().foldersMap["/proj"]
+    expect(folders.find((folder: any) => folder.name === "Tech").sessionIds).toEqual(["ses_8"])
+    expect(folders.find((folder: any) => folder.name === "Other").sessionIds).toEqual([])
     await cleanup?.()
   })
 
@@ -438,48 +484,108 @@ describe("opencode-session-autofile (V2 / @opencode/plugin promise contract)", (
     await cleanup?.()
   })
 
-  test("reconciliation is disabled when session.list is unavailable (true on real OpenCode 2.0.25 today)", async () => {
-    const { ctx } = makeCtx({ options: { apiBaseUrl: "http://localhost:9999" } })
-    const cleanup = await plugin.setup(ctx)
-    await new Promise((resolve) => setTimeout(resolve, 20))
-    expect(errorSpy.mock.calls.some((call) => String(call[1] ?? "").includes("session.list unavailable"))).toBe(true)
-    await cleanup?.()
-  })
-
-  test("forward-compat: if session.list exists, idle-triggered reconciliation still files misfiled tagged sessions", async () => {
-    const state = folderApi.getState()
-    state.foldersMap["/proj"] = [
-      { id: "sales", name: "Sales", sessionIds: [], createdAt: 1 },
-      { id: "client-work", name: "Client work", sessionIds: ["ses_wrong"], createdAt: 2 },
-    ]
-    const entries = [
-      session({ id: "ses_wrong", directory: "/proj", title: "Wrong folder [Sales]" }),
-      session({ id: "ses_missing", directory: "/proj", title: "Unassigned [Sales]" }),
-    ]
-    const sessionGet = async ({ sessionID }: { sessionID: string }) =>
-      entries.find((entry) => entry.id === sessionID) ?? session({ id: sessionID, title: "No tag" })
-    const sessionList = async (_input: unknown) => ({ data: entries, cursor: { next: null } })
-
-    const { ctx, push } = makeCtx({
-      options: { apiBaseUrl: "http://localhost:9999", mappings: { Sales: "Sales" }, fallbackMaxAttempts: 1 },
-      sessionGet,
-      sessionList,
-    })
-    const cleanup = await plugin.setup(ctx)
-    try {
+  describe("periodic sweep over OpenChamber's GET /api/session", () => {
+    // The first turn-end event triggers the sweep (lastSweepAt starts at 0).
+    async function runSweep(options: Record<string, unknown>, sessions: Array<Record<string, unknown>>, pageSize?: number) {
+      folderApi = createFolderApiMock({ sessions, pageSize })
+      globalThis.fetch = folderApi.fetchMock
+      const { ctx, push } = makeCtx({
+        options: { apiBaseUrl: "http://localhost:9999", fallbackMaxAttempts: 1, ...options },
+        sessionGet: async () => { throw new Error("session.get must not be needed by the sweep") },
+      })
+      const cleanup = await plugin.setup(ctx)
       push({ type: "session.execution.succeeded", data: { sessionID: "ses_trigger" } })
-      // No idle-triggered sweep fires on the very first execution event (lastReconcileAt
-      // starts at 0, but the gate is `now - lastReconcileAt >= reconcileIntervalMs`, which
-      // is true immediately since lastReconcileAt is 0 — this mirrors 0.4.1's own gate).
-      await waitUntil(() => {
-        const sales = folderApi.getState().foldersMap["/proj"]?.find((folder: any) => folder.name === "Sales")
-        return Boolean(sales?.sessionIds?.includes("ses_wrong") && sales.sessionIds?.includes("ses_missing"))
-      }, 3000)
-      const folders = folderApi.getState().foldersMap["/proj"]
-      expect(folders.find((folder: any) => folder.name === "Sales")?.sessionIds).toEqual(["ses_wrong", "ses_missing"])
-      expect(folders.find((folder: any) => folder.name === "Client work")?.sessionIds).toEqual([])
-    } finally {
-      await cleanup?.()
+      return cleanup!
     }
+
+    test("files misfiled and unfiled sessions by tag, keyword and directory, and puts back one that was moved by hand", async () => {
+      const sessions = [
+        session({ id: "ses_wrong", title: "Wrong folder [Sales]" }),
+        session({ id: "ses_tag", title: "Unassigned [Sales]" }),
+        session({ id: "ses_kw", title: "Cotización del cliente Acme" }),
+        session({ id: "ses_dir", directory: "/proj/family", title: "Whatever" }),
+        session({ id: "ses_none", title: "Nothing matches" }),
+      ]
+      folderApi = createFolderApiMock({ sessions })
+      folderApi.getState().foldersMap["/proj"] = [
+        { id: "sales", name: "Sales", sessionIds: [], createdAt: 1 },
+        { id: "client-work", name: "Client work", sessionIds: ["ses_wrong"], createdAt: 2 },
+      ]
+      globalThis.fetch = folderApi.fetchMock
+      const { ctx, push } = makeCtx({
+        options: {
+          apiBaseUrl: "http://localhost:9999",
+          fallbackMaxAttempts: 1,
+          rules: [
+            { folder: "Sales", keywords: ["cotizacion", "cliente*"] },
+            { folder: "Personal", tags: [], directories: ["/proj/family"] },
+          ],
+        },
+        sessionGet: async () => { throw new Error("not used") },
+      })
+      const cleanup = await plugin.setup(ctx)
+      try {
+        push({ type: "session.execution.succeeded", data: { sessionID: "ses_trigger" } })
+        await waitUntil(() => folderApi.postCallCount() >= 1)
+        const folders = folderApi.getState().foldersMap["/proj"]
+        const ids = (name: string) => folders.find((folder: any) => folder.name === name)?.sessionIds
+        expect(ids("Sales")).toEqual(["ses_wrong", "ses_tag", "ses_kw"])
+        expect(ids("Client work")).toEqual([])
+        // Folders are scoped by the session's own directory, so the directory-rule
+        // match lands in /proj/family's scope, not /proj's.
+        expect(folderApi.getState().foldersMap["/proj/family"].find((folder: any) => folder.name === "Personal").sessionIds).toEqual(["ses_dir"])
+        expect(ids("Personal")).toBeUndefined()
+        expect(folderApi.postCallCount()).toBe(1)
+      } finally {
+        await cleanup?.()
+      }
+    })
+
+    test("pagination terminates when the last page still carries a cursor", async () => {
+      const sessions = Array.from({ length: 5 }, (_, index) => session({ id: `ses_p${index}`, title: `Item ${index} [Tech]` }))
+      const cleanup = await runSweep({}, sessions, 2)
+      try {
+        await waitUntil(() => folderApi.postCallCount() >= 1)
+        const tech = folderApi.getState().foldersMap["/proj"].find((folder: any) => folder.name === "Tech")
+        expect(tech.sessionIds).toEqual(["ses_p0", "ses_p1", "ses_p2", "ses_p3", "ses_p4"])
+        // 5 sessions at 2 per page = 3 data pages + 1 empty page, then it stops.
+        expect(folderApi.listCallCount()).toBe(4)
+      } finally {
+        await cleanup()
+      }
+    })
+
+    test("archived sessions and subagents are skipped unless includeSubagents is set", async () => {
+      const sessions = [
+        session({ id: "ses_old", title: "Old [Tech]", archived: 1 }),
+        session({ id: "ses_child", title: "Child [Tech]", parentID: "ses_parent" }),
+        session({ id: "ses_ok", title: "Live [Tech]" }),
+      ]
+      const cleanup = await runSweep({}, sessions)
+      try {
+        await waitUntil(() => folderApi.postCallCount() >= 1)
+        expect(folderApi.getState().foldersMap["/proj"].find((folder: any) => folder.name === "Tech").sessionIds).toEqual(["ses_ok"])
+      } finally {
+        await cleanup()
+      }
+      const withChildren = await runSweep({ includeSubagents: true }, sessions)
+      try {
+        await waitUntil(() => folderApi.postCallCount() >= 1)
+        expect(folderApi.getState().foldersMap["/proj"].find((folder: any) => folder.name === "Tech").sessionIds).toEqual(["ses_child", "ses_ok"])
+      } finally {
+        await withChildren()
+      }
+    })
+
+    test("dryRun reports what would move and writes nothing", async () => {
+      const cleanup = await runSweep({ dryRun: true }, [session({ id: "ses_d", title: "Dry [Tech]" })])
+      try {
+        await waitUntil(() => folderApi.listCallCount() >= 1)
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        expect(folderApi.postCallCount()).toBe(0)
+      } finally {
+        await cleanup()
+      }
+    })
   })
 })

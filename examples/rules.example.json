@@ -1,0 +1,10 @@
+{
+  "rules": [
+    { "folder": "Sales", "description": "accounts, prospects, CRM, deals, Gong, outreach", "keywords": ["salesforce", "gong", "pfcrm", "prospect*", "cliente*", "account*", "quote", "cotizacion", "outreach"] },
+    { "folder": "Language", "description": "language learning, translation, or French study", "keywords": ["frances", "french", "francais", "anki", "traduccion"] },
+    { "folder": "Immigration", "description": "visas, residency, citizenship", "keywords": ["visa", "uscis", "residencia", "ciudadania", "green card"] },
+    { "folder": "Finance", "description": "budgeting, taxes, investments", "keywords": ["impuestos", "taxes", "presupuesto", "budget", "inversion*"] },
+    { "folder": "Personal", "description": "personal organization, family, health, everyday matters", "keywords": ["familia", "family", "salud", "news brief"] },
+    { "folder": "Tech", "description": "software, IT, OpenCode/OpenChamber, infrastructure, scripts", "keywords": ["opencode", "openchamber", "script", "plugin", "docker", "vm", "ansible", "skill", "runbook", "bug"] }
+  ]
+}
