@@ -11,6 +11,10 @@
 | `fallbackDelayMs` | `500` | Delay between those re-checks. `0`-`5000`. |
 | `reconcileIntervalMs` | `600000` | Sweep interval, `60000`-`86400000`. |
 
+## The `current_session` tool (0.7.0+)
+
+Takes no input and returns `ok: true` with the calling session's own id (confirmed through `ctx.session.get`), title, directory, `isChild` and `archived`, plus `workspaceID`/`parentID` when present. It is registered before `enabled` is read, so it stays available with `enabled: false` (that option only stops filing and the sweep) and when the rules file is broken. It never searches by title, never reads env/logs, and returns `{ ok: false, reason, guidance }` instead of throwing.
+
 ## Sweep details
 
 - Sessions come from `GET /api/session`, walked page by page (200 per page). The last page still carries a `cursor.next`, so the walk also stops on an empty page or a repeated cursor. At most 5,000 sessions are scanned per pass; if that cap is hit it is logged and recorded as `truncated`.

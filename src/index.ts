@@ -458,9 +458,94 @@ function scheduleSweep(delayMs: number) {
   shared.timer.unref?.()
 }
 
+// ---------------------------------------------------------------------------------
+// `current_session` tool: lets the model ask the runtime which session it is running
+// in. The id comes only from the tool-call context the runtime passes to `execute`
+// (that call's own session, even for a fork, subagent or /btw child), then is
+// confirmed with `session.get`. Nothing here may guess: no title search, no shared
+// "current" variable, no directory lookup, and nothing from `resolveRoot` (which is for
+// folder grouping and deliberately walks up to the root session).
+//
+// `execute` runs inside `Effect.promise`, so a rejection would become a defect rather
+// than a model-visible error. Failures are therefore returned as content, never thrown.
+// ---------------------------------------------------------------------------------
+
+const CURRENT_SESSION_TOOL = "current_session"
+
+const CURRENT_SESSION_DESCRIPTION =
+  "Returns the id, title, working directory and parent id of the session this very tool call is running in. " +
+  "Takes no input. Use it whenever you need your own session id (for example to schedule a follow-up into this same conversation); " +
+  "never search by title or pick the newest session instead. The id is authoritative; the title is a snapshot and may change."
+
+type ToolContentResult = { content: string }
+
+function currentSessionFailure(reason: string, message: string, contextSessionID?: string): ToolContentResult {
+  return {
+    content: JSON.stringify({
+      ok: false,
+      reason,
+      error: message,
+      ...(contextSessionID ? { contextSessionID } : {}),
+      guidance: "Do not guess this session's id from a title, the newest session, an environment variable or a log. Report that the current session id is unavailable.",
+    }),
+  }
+}
+
+async function describeCurrentSession(
+  getSession: (input: { sessionID: string }) => Promise<unknown>,
+  context: unknown,
+): Promise<ToolContentResult> {
+  const sessionID = (context as { sessionID?: unknown } | null | undefined)?.sessionID
+  if (typeof sessionID !== "string" || !sessionID) {
+    return currentSessionFailure("no-context", "The runtime did not provide a session id for this tool call.")
+  }
+  let info: SessionInfoLike | null
+  try {
+    info = await getSession({ sessionID }) as SessionInfoLike | null
+  } catch (error) {
+    return currentSessionFailure("lookup-failed", `Could not read session ${sessionID}: ${error instanceof Error ? error.message : String(error)}`, sessionID)
+  }
+  if (!info || typeof info.id !== "string" || info.id !== sessionID) {
+    return currentSessionFailure("id-mismatch", `session.get did not return session ${sessionID}.`, sessionID)
+  }
+  const workspaceID = (info.location as { workspaceID?: unknown } | undefined)?.workspaceID
+  return {
+    content: JSON.stringify({
+      ok: true,
+      id: info.id,
+      title: info.title ?? null,
+      directory: info.location?.directory ?? null,
+      ...(typeof workspaceID === "string" ? { workspaceID } : {}),
+      ...(info.parentID ? { parentID: info.parentID } : {}),
+      isChild: Boolean(info.parentID),
+      archived: archivedAt(info) > 0,
+    }),
+  }
+}
+
 export default {
   id: "opencode-session-autofile",
   async setup(ctx) {
+    // Registered first and unconditionally: it is independent of `enabled` (the filing
+    // kill switch) and of the rules, so a broken rules file or `enabled: false` never
+    // removes it. A host without `ctx.tool` just logs and filing carries on.
+    let toolRegistration: { dispose(): Promise<void> } | undefined
+    try {
+      toolRegistration = await ctx.tool.transform((editor) => {
+        editor.add({
+          name: CURRENT_SESSION_TOOL,
+          description: CURRENT_SESSION_DESCRIPTION,
+          input: { type: "object", properties: {}, additionalProperties: false },
+          // Direct tool, not Code Mode only: "call current_session first" must not
+          // depend on going through `execute`.
+          options: { codemode: false },
+          execute: (_input, context) => describeCurrentSession((input) => ctx.session.get(input), context),
+        })
+      })
+    } catch (error) {
+      log("could not register the current_session tool; filing continues", error instanceof Error ? error.message : error)
+    }
+
     const config = resolveOptions(ctx.options)
     const instanceKey = Symbol("autofile-instance")
     const source = createRulesSource({ rulesFile: config.rulesFile, optional: config.rulesFileOptional, inline: config.inlineRules, log })
@@ -621,6 +706,7 @@ export default {
       // The sweep outlives its instances on purpose (see `shared`).
       shared.instances.delete(instanceKey)
       await titleHook.dispose().catch(() => {})
+      await toolRegistration?.dispose().catch(() => {})
       if (config.enabled) await diagnostic("disposed")
     }
   },

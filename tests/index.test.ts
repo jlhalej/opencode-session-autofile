@@ -183,8 +183,16 @@ function makeCtx(opts: {
   projectId?: string
   sessionGet?: (args: unknown) => Promise<unknown>
   sessionList?: (args: unknown) => Promise<unknown>
+  // `false` leaves `ctx.tool` out, like a host that predates the tool domain.
+  withTool?: boolean
 }) {
   const bus = makeEventBus()
+  const toolState = {
+    definitions: [] as any[],
+    transforms: 0,
+    disposed: 0,
+    transformError: undefined as Error | undefined,
+  }
   const titleHook: { callback?: (request: any) => Promise<void> | void } = {}
   const session: Record<string, unknown> = {
     get: opts.sessionGet ?? (async () => { throw new Error("session.get not wired in this test") }),
@@ -200,8 +208,18 @@ function makeCtx(opts: {
     app: { name: "opencode", version: "2.0.25", channel: "stable" },
     event: { subscribe: bus.subscribe },
     session,
+    ...(opts.withTool === false ? {} : {
+      tool: {
+        transform: async (callback: (editor: any) => void) => {
+          toolState.transforms += 1
+          if (toolState.transformError) throw toolState.transformError
+          callback({ add: (definition: any) => toolState.definitions.push(definition) })
+          return { dispose: async () => { toolState.disposed += 1 } }
+        },
+      },
+    }),
   }
-  return { ctx: ctx as any, push: bus.push, titleHook }
+  return { ctx: ctx as any, push: bus.push, titleHook, toolState }
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -654,6 +672,194 @@ describe("opencode-session-autofile (V2 / @opencode/plugin promise contract)", (
       } finally {
         await cleanup()
       }
+    })
+  })
+
+  describe("current_session tool", () => {
+    const toolContext = (sessionID?: string) => ({ sessionID, agent: "build", messageID: "msg_1", id: "call_1", signal: new AbortController().signal, progress: async () => {} })
+    const parse = (result: any) => JSON.parse(result.content)
+
+    // Session store keyed by id, so every lookup answers for exactly the id asked.
+    const store = (entries: Record<string, Record<string, unknown>>) => async (args: any) => {
+      const found = entries[args.sessionID]
+      if (!found) throw new Error(`session ${args.sessionID} not found`)
+      return found
+    }
+
+    async function setupWithTool(sessionGet: (args: unknown) => Promise<unknown>, options: Record<string, unknown> = {}) {
+      const made = makeCtx({ options: { apiBaseUrl: "http://localhost:9999", ...options }, sessionGet })
+      const cleanup = await plugin.setup(made.ctx)
+      const definition = made.toolState.definitions[0]
+      return { ...made, cleanup, definition, run: (sessionID?: string) => definition.execute({}, toolContext(sessionID)) }
+    }
+
+    test("registers one direct tool with an empty-object input schema", async () => {
+      const { definition, toolState, cleanup } = await setupWithTool(store({}))
+      expect(toolState.definitions).toHaveLength(1)
+      expect(definition.name).toBe("current_session")
+      expect(definition.input).toEqual({ type: "object", properties: {}, additionalProperties: false })
+      expect(definition.options).toEqual({ codemode: false })
+      expect(definition.description).toContain("never search by title")
+      await cleanup?.()
+    })
+
+    test("returns the calling session's own id, title, directory and parent", async () => {
+      const entries = { ses_a: session({ id: "ses_a", title: "Work [Tech]", directory: "/proj/a" }) }
+      const { run, cleanup } = await setupWithTool(store(entries))
+      expect(parse(await run("ses_a"))).toEqual({ ok: true, id: "ses_a", title: "Work [Tech]", directory: "/proj/a", isChild: false, archived: false })
+      await cleanup?.()
+    })
+
+    test("concurrent calls from different sessions each get their own id", async () => {
+      const entries: Record<string, Record<string, unknown>> = {}
+      for (let index = 0; index < 20; index += 1) entries[`ses_${index}`] = session({ id: `ses_${index}`, title: "Same title", directory: `/proj/${index % 3}` })
+      // Slow, out-of-order lookups: answers must still pair with the question.
+      const lookup = async (args: any) => {
+        await new Promise((resolve) => setTimeout(resolve, 20 - Number(args.sessionID.slice(4))))
+        return entries[args.sessionID]
+      }
+      const { run, cleanup } = await setupWithTool(lookup)
+      const results = await Promise.all(Object.keys(entries).map((id) => run(id)))
+      expect(results.map((result) => parse(result).id)).toEqual(Object.keys(entries))
+      await cleanup?.()
+    })
+
+    test("identical titles never confuse identity", async () => {
+      const entries = {
+        ses_1: session({ id: "ses_1", title: "Resume this [Tech]" }),
+        ses_2: session({ id: "ses_2", title: "Resume this [Tech]" }),
+      }
+      const { run, cleanup } = await setupWithTool(store(entries))
+      expect(parse(await run("ses_2")).id).toBe("ses_2")
+      expect(parse(await run("ses_1")).id).toBe("ses_1")
+      await cleanup?.()
+    })
+
+    test("a rename between calls changes the title but never the id", async () => {
+      const entries: Record<string, Record<string, unknown>> = { ses_r: session({ id: "ses_r", title: "Old title" }) }
+      const { run, cleanup } = await setupWithTool(store(entries))
+      const before = parse(await run("ses_r"))
+      entries.ses_r = session({ id: "ses_r", title: "AI renamed [Sales]" })
+      const after = parse(await run("ses_r"))
+      expect(before).toMatchObject({ id: "ses_r", title: "Old title" })
+      expect(after).toMatchObject({ id: "ses_r", title: "AI renamed [Sales]" })
+      await cleanup?.()
+    })
+
+    test("still available when filing is disabled (enabled: false)", async () => {
+      const entries = { ses_off: session({ id: "ses_off", title: "x" }) }
+      const { run, cleanup } = await setupWithTool(store(entries), { enabled: false })
+      expect(parse(await run("ses_off")).id).toBe("ses_off")
+      await cleanup?.()
+    })
+
+    test("a child session reports its own id, not its parent or root", async () => {
+      const entries = {
+        ses_root: session({ id: "ses_root", title: "Root [Tech]" }),
+        ses_child: session({ id: "ses_child", title: "Subagent", parentID: "ses_root" }),
+      }
+      const { run, cleanup } = await setupWithTool(store(entries))
+      expect(parse(await run("ses_child"))).toMatchObject({ id: "ses_child", parentID: "ses_root", isChild: true })
+      await cleanup?.()
+    })
+
+    test("worktree metadata is reported from the session's own location", async () => {
+      const entries = { ses_w: { ...session({ id: "ses_w", directory: "/work/tree-1" }), location: { directory: "/work/tree-1", workspaceID: "wrk_9" } } }
+      const { run, cleanup } = await setupWithTool(store(entries))
+      expect(parse(await run("ses_w"))).toMatchObject({ id: "ses_w", directory: "/work/tree-1", workspaceID: "wrk_9" })
+      await cleanup?.()
+    })
+
+    test("archived state is surfaced", async () => {
+      const entries = { ses_z: session({ id: "ses_z", archived: 1700000000000 }) }
+      const { run, cleanup } = await setupWithTool(store(entries))
+      expect(parse(await run("ses_z")).archived).toBe(true)
+      await cleanup?.()
+    })
+
+    test("missing context returns a structured error without calling session.get", async () => {
+      const get = makeSessionGetQueue([session({ id: "ses_never" })])
+      const { definition, cleanup } = await setupWithTool(get.fn)
+      for (const context of [undefined, null, {}, { sessionID: "" }, { sessionID: 7 }]) {
+        const result = parse(await definition.execute({}, context))
+        expect(result).toMatchObject({ ok: false, reason: "no-context" })
+        expect(result.id).toBeUndefined()
+      }
+      expect(get.callCount()).toBe(0)
+      await cleanup?.()
+    })
+
+    test("a failing session.get returns an error naming the context id, never another id", async () => {
+      const { run, cleanup } = await setupWithTool(async () => { throw new Error("backend down") })
+      const result = parse(await run("ses_x"))
+      expect(result).toMatchObject({ ok: false, reason: "lookup-failed", contextSessionID: "ses_x" })
+      expect(result.error).toContain("backend down")
+      expect(result.id).toBeUndefined()
+      await cleanup?.()
+    })
+
+    test("an id mismatch from session.get is an error, not a substitute id", async () => {
+      const { run, cleanup } = await setupWithTool(async () => session({ id: "ses_other", title: "Someone else" }))
+      const result = parse(await run("ses_asked"))
+      expect(result).toMatchObject({ ok: false, reason: "id-mismatch", contextSessionID: "ses_asked" })
+      expect(result.id).toBeUndefined()
+      expect(parse(await (await setupWithTool(async () => null)).run("ses_asked")).reason).toBe("id-mismatch")
+      await cleanup?.()
+    })
+
+    test("the executor never rejects", async () => {
+      const { definition, cleanup } = await setupWithTool(async () => { throw "not even an Error" })
+      await expect(definition.execute({}, toolContext("ses_q"))).resolves.toBeDefined()
+      await cleanup?.()
+    })
+
+    test("never reads ctx.location.directory or the title to decide identity", async () => {
+      const calls: unknown[] = []
+      const { run, cleanup } = await setupWithTool(async (args: any) => { calls.push(args); return session({ id: args.sessionID, directory: "/elsewhere" }) })
+      await run("ses_only")
+      expect(calls).toEqual([{ sessionID: "ses_only" }])
+      await cleanup?.()
+    })
+
+    test("a host without ctx.tool still loads and files sessions", async () => {
+      const sessionGet = makeSessionGetQueue([session({ id: "ses_nt", directory: "/proj", title: "Fix [Tech]" })])
+      const { ctx, push } = makeCtx({ options: { apiBaseUrl: "http://localhost:9999" }, sessionGet: sessionGet.fn, withTool: false })
+      const cleanup = await plugin.setup(ctx)
+      push({ type: "session.renamed", data: { sessionID: "ses_nt", title: "Fix [Tech]" } })
+      await waitUntil(() => folderApi.postCallCount() >= 1)
+      expect(folderApi.getState().foldersMap["/proj"][0].sessionIds).toEqual(["ses_nt"])
+      await cleanup?.()
+    })
+
+    test("a failing tool registration is logged and filing still works", async () => {
+      const sessionGet = makeSessionGetQueue([session({ id: "ses_tf", directory: "/proj", title: "Fix [Tech]" })])
+      const made = makeCtx({ options: { apiBaseUrl: "http://localhost:9999" }, sessionGet: sessionGet.fn })
+      made.toolState.transformError = new Error("transform rejected")
+      const cleanup = await plugin.setup(made.ctx)
+      made.push({ type: "session.renamed", data: { sessionID: "ses_tf", title: "Fix [Tech]" } })
+      await waitUntil(() => folderApi.postCallCount() >= 1)
+      expect(errorSpy.mock.calls.some((call) => String(call[1]).includes("could not register"))).toBe(true)
+      await cleanup?.()
+      expect(made.toolState.disposed).toBe(0)
+    })
+
+    test("cleanup disposes the tool registration exactly once", async () => {
+      const { cleanup, toolState } = await setupWithTool(store({}))
+      expect(toolState.disposed).toBe(0)
+      await cleanup?.()
+      expect(toolState.disposed).toBe(1)
+    })
+
+    test("two plugin instances (two directories) register independently and answer for their caller", async () => {
+      const entries = { ses_d1: session({ id: "ses_d1", directory: "/d1" }), ses_d2: session({ id: "ses_d2", directory: "/d2" }) }
+      const one = await setupWithTool(store(entries))
+      const two = await setupWithTool(store(entries))
+      expect(parse(await one.run("ses_d1")).directory).toBe("/d1")
+      expect(parse(await two.run("ses_d2")).directory).toBe("/d2")
+      await one.cleanup?.()
+      await two.cleanup?.()
+      expect(one.toolState.disposed).toBe(1)
+      expect(two.toolState.disposed).toBe(1)
     })
   })
 })
